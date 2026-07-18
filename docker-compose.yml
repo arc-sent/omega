@@ -1,0 +1,20 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - VK_PUBLISH_CONCURRENCY=${VK_PUBLISH_CONCURRENCY:-1}
+      - VK_PUBLISH_RETRIES=${VK_PUBLISH_RETRIES:-3}
+      - VK_RETRY_BASE_DELAY=${VK_RETRY_BASE_DELAY:-3}
+      - PUBLISH_JITTER_SECONDS=${PUBLISH_JITTER_SECONDS:-300}
+      - DAILY_PLAN_HOUR=${DAILY_PLAN_HOUR:-0}
+      - DAILY_PLAN_MINUTE=${DAILY_PLAN_MINUTE:-5}
+      - ERROR_RETENTION_DAYS=${ERROR_RETENTION_DAYS:-5}
+      - ERROR_CLEANUP_INTERVAL_DAYS=${ERROR_CLEANUP_INTERVAL_DAYS:-5}
+    volumes:
+      - ./data:/app/data
+      # Базы парсера должны быть доступны боту по тем же путям, что указаны в
+      # источниках. Смонтируй папку с базами парсера сюда (пример):
+      # - C:/Users/androed/Desktop/парсер:/parser:ro

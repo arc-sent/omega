@@ -1,0 +1,17 @@
+# Секреты
+.env
+
+# Данные бота (база, состояние, временные видео)
+data/
+*.db
+*.db-wal
+*.db-shm
+bot_state.pickle
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Временные видео
+*.mp4
