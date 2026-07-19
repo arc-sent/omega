@@ -24,10 +24,14 @@ class VKError(RuntimeError):
     ошибки тоже имеет смысл повторять.
     """
 
-    def __init__(self, code: int | None, message: str, *, stage: str | None = None, network: bool = False):
+    def __init__(self, code: int | None, message: str, *, stage: str | None = None,
+                 network: bool = False, no_retry: bool = False):
         self.code = code
         self.stage = stage
         self.network = network
+        # no_retry=True: повтор небезопасен, даже если ошибка выглядит временной
+        # (например, ответ wall.post потерян — запись могла уже создаться).
+        self.no_retry = no_retry
         super().__init__(message)
 
 
@@ -144,7 +148,11 @@ def upload_to_vk(
             "https://api.vk.com/method/wall.post", data=wall_params, timeout=30
         ).json()
     except requests.exceptions.RequestException as exc:
-        raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
+        # Видео уже залито, запрос ушёл — ответ мог потеряться уже ПОСЛЕ создания
+        # записи. Повторять весь upload_to_vk нельзя: получим второй пост в том же
+        # слоте. Помечаем no_retry и НЕ откатываем видео (запись могла пройти).
+        raise VKError(None, f"сетевая ошибка (запись могла быть создана): {exc}",
+                      stage=stage, network=True, no_retry=True) from exc
     logger.info("wall.post response: %s", wall_resp)
 
     if "error" in wall_resp:

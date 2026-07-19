@@ -81,7 +81,7 @@ async def _publish_to_vk(telegram_id, vk_token, vk_group_id, file_path, title, d
                 )
                 return
             except VKError as exc:
-                retryable = exc.network or exc.code in VK_RETRYABLE_ERROR_CODES
+                retryable = (exc.network or exc.code in VK_RETRYABLE_ERROR_CODES) and not exc.no_retry
                 if not retryable or attempt == VK_PUBLISH_RETRIES:
                     raise
                 last_exc = exc
@@ -215,7 +215,8 @@ def plan_rule(job_queue, rule) -> int:
             vk_group_name=rule["group_name"],
             publish_at=publish_at,
         )
-        # Читаем строку обратно, чтобы поставить job единообразно.
+        if post_id is None:
+            continue  # видео уже в очереди (гонка/второй экземпляр) — не задваиваем
         _schedule_post_job(job_queue, {"id": post_id, "publish_at": publish_at})
         scheduled += 1
     logger.info("Правило %s (%s → %s): запланировано %s видео",
@@ -256,6 +257,8 @@ def schedule_test_now(job_queue, rule_id: int) -> tuple[bool, str]:
         description=rule["description"], vk_group_id=rule["vk_group_id"],
         vk_group_name=rule["group_name"], publish_at=publish_at,
     )
+    if post_id is None:
+        return False, "Это видео уже стоит в очереди на публикацию."
     _schedule_post_job(job_queue, {"id": post_id, "publish_at": publish_at})
     return True, f"▶️ Публикую тестовое видео (~через 5 сек):\n{v['url']}"
 
@@ -398,6 +401,15 @@ async def _publish_job(context) -> None:
     telegram_id = post["telegram_id"]
     rule_id = post["rule_id"]
     url = post["url"]
+
+    # Страховка от повторной публикации: если по этому правилу видео уже отмечено
+    # опубликованным (задвоенный job, гонка, повторный запуск) — ничего не постим,
+    # только убираем строку из очереди.
+    if post["tt_video_id"] in db.get_published_ids(rule_id):
+        logger.info("Пропуск публикации rule=%s video=%s: уже опубликовано",
+                    rule_id, post["tt_video_id"])
+        db.delete_scheduled_post(post_id)
+        return
     group_name = post["vk_group_name"]
     vk_group_id = post["vk_group_id"]
     platform = detect_platform(url)

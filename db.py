@@ -145,6 +145,22 @@ def init_db() -> None:
                 "ALTER TABLE sources ADD COLUMN backfill_done INTEGER NOT NULL DEFAULT 0"
             )
 
+        # Одно видео не может стоять в очереди по одному правилу дважды. Сначала
+        # чистим уже накопленные дубли (оставляем самую раннюю строку), затем
+        # вешаем уникальный индекс — дальше INSERT OR IGNORE не даст задвоить.
+        conn.execute(
+            """
+            DELETE FROM scheduled_posts
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM scheduled_posts GROUP BY rule_id, tt_video_id
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sched_unique "
+            "ON scheduled_posts (rule_id, tt_video_id)"
+        )
+
 
 # ─── Пользователи ─────────────────────────────────────────────────────────────
 
@@ -438,11 +454,13 @@ def add_scheduled_post(
     vk_group_id: int,
     vk_group_name: str,
     publish_at: int,
-) -> int:
+) -> int | None:
+    """Поставить публикацию в очередь. Вернуть id новой строки, либо None, если
+    это видео уже стоит в очереди по данному правилу (дубль не создаётся)."""
     with _connect() as conn:
         cur = conn.execute(
             """
-            INSERT INTO scheduled_posts
+            INSERT OR IGNORE INTO scheduled_posts
                 (telegram_id, rule_id, tt_video_id, url, title, description,
                  vk_group_id, vk_group_name, publish_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -450,6 +468,8 @@ def add_scheduled_post(
             (telegram_id, rule_id, tt_video_id, url, title, description,
              vk_group_id, vk_group_name, publish_at),
         )
+        if cur.rowcount == 0:
+            return None  # уникальный индекс (rule_id, tt_video_id) отсёк дубль
         return cur.lastrowid
 
 
