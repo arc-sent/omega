@@ -118,6 +118,19 @@ def parse_slots(slots_csv: str) -> list[int]:
     return sorted(hours)
 
 
+def _base_slot_times(slots: list[int], now: datetime) -> list[datetime]:
+    """Слоты ближайшей раскладки: будущие слоты сегодня, иначе — все слоты завтра."""
+    def slot_dt(date, h):
+        return MOSCOW_TZ.localize(datetime(date.year, date.month, date.day, h))
+
+    today = now.date()
+    base = [slot_dt(today, h) for h in slots if slot_dt(today, h) > now + timedelta(minutes=2)]
+    if not base:
+        tomorrow = today + timedelta(days=1)
+        base = [slot_dt(tomorrow, h) for h in slots]
+    return base
+
+
 def compute_publish_times(slots: list[int], n: int, now: datetime) -> list[datetime]:
     """Вернуть n моментов публикации, распределяя видео по слотам.
 
@@ -127,16 +140,7 @@ def compute_publish_times(slots: list[int], n: int, now: datetime) -> list[datet
     """
     if n <= 0 or not slots:
         return []
-
-    def slot_dt(date, h):
-        return MOSCOW_TZ.localize(datetime(date.year, date.month, date.day, h))
-
-    today = now.date()
-    base = [slot_dt(today, h) for h in slots if slot_dt(today, h) > now + timedelta(minutes=2)]
-    if not base:
-        tomorrow = today + timedelta(days=1)
-        base = [slot_dt(tomorrow, h) for h in slots]
-
+    base = _base_slot_times(slots, now)
     return [base[i % len(base)] for i in range(n)]
 
 
@@ -176,6 +180,20 @@ def plan_rule(job_queue, rule) -> int:
     if remaining <= 0:
         return 0
 
+    # Пропущенное за сегодня НЕ «догоняем»: ставим максимум по одному ролику на
+    # слот и только на СВОБОДНЫЕ будущие слоты. Слот считаем занятым, если по
+    # этому правилу в его пределах (в течение часа) уже стоит публикация — так
+    # повторные прогоны/рестарты в пределах дня не сваливают пачку в один слот.
+    base_times = _base_slot_times(slots, now) if slots else []
+    taken = db.get_scheduled_publish_times(rule_id)
+    free_times = [
+        t for t in base_times
+        if not any(int(t.timestamp()) <= at < int(t.timestamp()) + 3600 for at in taken)
+    ]
+    remaining = min(remaining, len(free_times))
+    if remaining <= 0:
+        return 0
+
     # Исключаем уже опубликованные И уже стоящие в очереди — чтобы не задвоить.
     exclude = db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id)
 
@@ -198,7 +216,8 @@ def plan_rule(job_queue, rule) -> int:
     if not candidates:
         return 0
 
-    times = compute_publish_times(slots, len(candidates), now)
+    # По одному ролику на свободный слот (кандидатов не больше, чем свободных слотов).
+    times = free_times[:len(candidates)]
 
     scheduled = 0
     for video, base_time in zip(candidates, times):

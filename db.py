@@ -432,6 +432,18 @@ def get_scheduled_ids(rule_id: int) -> set[str]:
     return {r["tt_video_id"] for r in rows}
 
 
+def get_scheduled_publish_times(rule_id: int) -> list[int]:
+    """Моменты (publish_at) всех публикаций правила, уже стоящих в очереди.
+
+    Нужно планировщику, чтобы не ставить второй ролик на уже занятый слот
+    (защита от «пачки» при повторных прогонах/рестартах в пределах дня)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT publish_at FROM scheduled_posts WHERE rule_id = ?", (rule_id,)
+        ).fetchall()
+    return [r["publish_at"] for r in rows]
+
+
 def count_scheduled_between(rule_id: int, start_ts: int, end_ts: int) -> int:
     """Сколько публикаций правила уже стоит в очереди на интервал (для дневной квоты)."""
     with _connect() as conn:
