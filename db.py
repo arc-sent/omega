@@ -58,6 +58,7 @@ def init_db() -> None:
                 kind        TEXT NOT NULL DEFAULT 'db',  -- 'db' | 'account'
                 account     TEXT,                -- ник/ссылка TikTok (для kind='account')
                 backfill_done INTEGER NOT NULL DEFAULT 0,  -- 1 = вся история аккаунта уже собрана
+                parse_start INTEGER NOT NULL DEFAULT 1,    -- с какого ролика парсить (1-based; kind='account')
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
                 UNIQUE (telegram_id, name)
             );
@@ -143,6 +144,10 @@ def init_db() -> None:
         if "backfill_done" not in cols:
             conn.execute(
                 "ALTER TABLE sources ADD COLUMN backfill_done INTEGER NOT NULL DEFAULT 0"
+            )
+        if "parse_start" not in cols:
+            conn.execute(
+                "ALTER TABLE sources ADD COLUMN parse_start INTEGER NOT NULL DEFAULT 1"
             )
 
         # Одно видео не может стоять в очереди по одному правилу дважды. Сначала
@@ -259,6 +264,15 @@ def set_source_db_path(source_id: int, db_path: str) -> None:
     """Проставить путь к базе (для источника-аккаунта — после получения id)."""
     with _connect() as conn:
         conn.execute("UPDATE sources SET db_path = ? WHERE id = ?", (db_path, source_id))
+
+
+def set_source_parse_start(source_id: int, parse_start: int) -> None:
+    """С какого ролика (1-based) парсить источник-аккаунт при обновлении."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE sources SET parse_start = ? WHERE id = ?",
+            (max(int(parse_start), 1), source_id),
+        )
 
 
 def get_account_sources() -> list[sqlite3.Row]:

@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 # ─── Состояния разговоров ─────────────────────────────────────────────────────
 TOKEN_WAIT = 10
 G_ADD_ID, G_ADD_CONFIRM, G_ADD_NAME, G_RENAME = range(20, 24)
-SRC_NAME, SRC_TYPE, SRC_ACCOUNT, SRC_PATH, SRC_USER = range(30, 35)
+SRC_NAME, SRC_TYPE, SRC_ACCOUNT, SRC_PATH, SRC_USER, SRC_START = range(30, 36)
 RULE_EDIT_VALUE = 40
 
 # ─── Постоянное меню ──────────────────────────────────────────────────────────
@@ -321,6 +321,8 @@ def sources_kb(telegram_id: int) -> InlineKeyboardMarkup:
         btn_row = []
         if s["kind"] == "account":
             btn_row.append(InlineKeyboardButton("🔄 Обновить", callback_data=f"src_refresh_{s['id']}"))
+            start = s["parse_start"] if "parse_start" in s.keys() else 1
+            btn_row.append(InlineKeyboardButton(f"⚙️ Старт: {start}", callback_data=f"src_start_{s['id']}"))
         btn_row.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"src_del_{s['id']}"))
         rows.append(btn_row)
     rows.append([InlineKeyboardButton("➕ Добавить источник", callback_data="src_add")])
@@ -352,7 +354,45 @@ async def sources_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Обновляю…")
         await _refresh_source(query, int(data.rsplit("_", 1)[1]))
         return ConversationHandler.END
+    if data.startswith("src_start_"):
+        sid = int(data.rsplit("_", 1)[1])
+        s = db.get_source(sid)
+        if not s or s["kind"] != "account":
+            await query.answer()
+            return ConversationHandler.END
+        await query.answer()
+        context.user_data["src_start_id"] = sid
+        cur = s["parse_start"] if "parse_start" in s.keys() else 1
+        await query.edit_message_text(
+            f"С какого ролика начинать парсинг @{s['account']}?\n\n"
+            f"Сейчас: {cur} (1 = с самого свежего).\n"
+            "Пришли число (например 20 — пропустить 19 свежих и парсить окно старее).\n\n"
+            "⚠️ Резервный embed-парсер отдаёт лишь последние ~10-30 роликов, "
+            "поэтому большой старт сработает только пока yt-dlp читает аккаунт."
+        )
+        return SRC_START
     await query.answer()
+    return ConversationHandler.END
+
+
+async def sources_start_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip()
+    try:
+        start = int(raw)
+        if start < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Нужно целое число ≥ 1. Пришли ещё раз или /cancel.")
+        return SRC_START
+    sid = context.user_data.get("src_start_id")
+    if sid is None:
+        return ConversationHandler.END
+    db.set_source_parse_start(sid, start)
+    await update.message.reply_text(
+        f"✅ Старт парсинга: {start}. Применится при следующем обновлении.\n\n"
+        "Твои источники:",
+        reply_markup=sources_kb(update.effective_user.id),
+    )
     return ConversationHandler.END
 
 
@@ -363,10 +403,14 @@ async def _refresh_source(query, source_id: int) -> None:
         return
     await query.edit_message_text(f"⏳ Парсю @{s['account']}…")
     path = s["db_path"] or account_source.source_db_path(source_id)
+    start = s["parse_start"] if "parse_start" in s.keys() else 1
     loop = asyncio.get_running_loop()
     try:
-        res = await loop.run_in_executor(None, account_source.refresh_account, s["account"], path)
-        note = f"✅ @{res['username']}: всего {res['total']}, новых {res['added']}."
+        res = await loop.run_in_executor(
+            None, account_source.refresh_account, s["account"], path,
+            account_source.PARSE_LIMIT, start,
+        )
+        note = f"✅ @{res['username']}: всего {res['total']}, новых {res['added']} (старт {start})."
     except Exception as exc:
         note = f"❌ Не удалось спарсить @{s['account']}:\n{exc}"
     await query.message.reply_text(note)
@@ -950,7 +994,7 @@ def main() -> None:
     sources_conv = ConversationHandler(
         entry_points=[
             CommandHandler("sources", cmd_sources),
-            CallbackQueryHandler(sources_button, pattern=r"^(src_add|src_del_|src_refresh_)"),
+            CallbackQueryHandler(sources_button, pattern=r"^(src_add|src_del_|src_refresh_|src_start_)"),
         ],
         states={
             SRC_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_name)],
@@ -958,6 +1002,7 @@ def main() -> None:
             SRC_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_account)],
             SRC_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_path)],
             SRC_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_user)],
+            SRC_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_start_save)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         conversation_timeout=300, name="sources_conv", persistent=False, allow_reentry=True,

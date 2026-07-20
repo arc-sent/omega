@@ -146,19 +146,21 @@ def resolve_channel_id(username: str) -> str:
     return str(user_id)
 
 
-def fetch_videos_embed(username: str, limit: int) -> list:
+def fetch_videos_embed(username: str, limit: int, start: int = 1) -> list:
     """Собственный сбор видео из embed-страницы (без yt-dlp).
 
     Возвращает entries в том же формате, что и yt-dlp: dict с ключами
     id / url / title — чтобы save_videos работал без изменений.
-    Ограничение: embed отдаёт только последние ~10-30 видео (без пагинации).
+    Ограничение: embed отдаёт только последние ~10-30 видео (без пагинации),
+    поэтому start здесь — лишь смещение внутри этого короткого списка.
     """
     node = _fetch_embed(username)
     author = node.get("userInfo", {}).get("uniqueId") or username
     video_list = node.get("videoList") or []
 
+    offset = max(start - 1, 0)  # start 1-based → индекс с 0
     entries = []
-    for v in video_list[:limit]:
+    for v in video_list[offset:offset + limit]:
         vid = v.get("id")
         if not vid:
             continue
@@ -213,13 +215,18 @@ class ExtractionError(Exception):
     """Не удалось получить список видео (yt-dlp вернул ошибку экстрактора)."""
 
 
-def fetch_videos(profile_url: str, limit: int):
+def fetch_videos(profile_url: str, limit: int, start: int = 1):
     """Вернуть список entries (dict) без скачивания видео.
+
+    start (1-based) — с какого ролика списка (новые→старые) начинать: 1 = с
+    самого свежего, 20 = пропустить 19 свежих и взять окно начиная с 20-го.
+    limit — размер окна (сколько роликов взять начиная со start).
 
     Отличает «профиль не распарсился» (ExtractionError) от «профиль пустой»
     (пустой список без ошибок). Ошибки yt-dlp перехватываются через logger,
     чтобы не смешивать их с легитимно пустым профилем.
     """
+    start = max(start, 1)
     collected_errors: list[str] = []
 
     class _Logger:
@@ -241,7 +248,8 @@ def fetch_videos(profile_url: str, limit: int):
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,   # не бросать исключение, а звать logger.error
-        "playlistend": limit,   # только последние N
+        "playliststart": start,             # с какого ролика (1-based, включительно)
+        "playlistend": start + limit - 1,   # по какой (включительно) — окно из limit штук
         "logger": _Logger(),
     }
     with YoutubeDL(ydl_opts) as ydl:
@@ -459,7 +467,11 @@ def main() -> int:
     parser.add_argument("account", help="Ссылка на TikTok-аккаунт или username")
     parser.add_argument(
         "--limit", type=int, default=50,
-        help="Сколько последних видео проверять (по умолчанию 50)",
+        help="Сколько видео взять начиная со --start (по умолчанию 50)",
+    )
+    parser.add_argument(
+        "--start", type=int, default=1,
+        help="С какого ролика начинать (1-based, 1 = самый свежий; по умолчанию 1)",
     )
     parser.add_argument(
         "--db", default=None,
@@ -498,7 +510,7 @@ def main() -> int:
 
     # Получение списка видео
     try:
-        entries = fetch_videos(profile_url, args.limit)
+        entries = fetch_videos(profile_url, args.limit, args.start)
     except (ExtractionError, DownloadError, ExtractorError) as e:
         # yt-dlp не справился. Если запуск был по нику — переключаемся на
         # собственный парсер (embed-страница), который тут работает без куки.
@@ -508,7 +520,7 @@ def main() -> int:
             print(f"Переключаюсь на собственный парсер (embed) для @{username}...",
                   file=sys.stderr)
             try:
-                entries = fetch_videos_embed(username, args.limit)
+                entries = fetch_videos_embed(username, args.limit, args.start)
                 source = "embed"
             except ResolveError as re_err:
                 print(f"Ошибка: {re_err}", file=sys.stderr)

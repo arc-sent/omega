@@ -34,19 +34,23 @@ def normalize(account: str) -> tuple[str, str]:
     return pt.normalize_account(account)
 
 
-def _fetch(account: str, limit: int) -> tuple[str, list, str]:
-    """Собрать до `limit` роликов от верха списка. Вернуть (username, entries, source)."""
+def _fetch(account: str, limit: int, start: int = 1) -> tuple[str, list, str]:
+    """Собрать `limit` роликов начиная со `start`-го (1-based, новые→старые).
+
+    start=1 — с самого свежего; start=20 — пропустить 19 свежих. Вернуть
+    (username, entries, source).
+    """
     username, profile_url = pt.normalize_account(account)
     is_username_form = profile_url.startswith("https://")
 
     source = "yt-dlp"
     try:
-        entries = pt.fetch_videos(profile_url, limit)
+        entries = pt.fetch_videos(profile_url, limit, start)
     except (pt.ExtractionError, pt.DownloadError, pt.ExtractorError):
         # yt-dlp не справился — для запуска по нику пробуем embed-страницу.
         if not is_username_form:
             raise
-        entries = pt.fetch_videos_embed(username, limit)
+        entries = pt.fetch_videos_embed(username, limit, start)
         source = "embed"
     return username, entries, source
 
@@ -73,16 +77,19 @@ def count_videos(db_path: str) -> int:
         conn.close()
 
 
-def refresh_account(account: str, db_path: str, limit: int = PARSE_LIMIT) -> dict:
+def refresh_account(account: str, db_path: str, limit: int = PARSE_LIMIT,
+                    start: int = 1) -> dict:
     """Спарсить аккаунт и дописать новые видео в базу источника.
 
-    Возвращает {username, added, total, source}. Бросает исключения парсера,
-    если ни yt-dlp, ни embed не смогли собрать видео.
+    start (1-based) — с какого ролика начинать (1 = с самого свежего). Позволяет
+    пропустить N свежих роликов и парсить окно старее. Возвращает
+    {username, added, total, source}. Бросает исключения парсера, если ни
+    yt-dlp, ни embed не смогли собрать видео.
     """
-    username, entries, source = _fetch(account, limit)
+    username, entries, source = _fetch(account, limit, start)
     added = _save(username, db_path, entries)
-    logger.info("Парсинг @%s: всего %s, новых %s (источник %s)",
-                username, len(entries), added, source)
+    logger.info("Парсинг @%s: старт %s, всего %s, новых %s (источник %s)",
+                username, start, len(entries), added, source)
     return {"username": username, "added": added, "total": len(entries), "source": source}
 
 

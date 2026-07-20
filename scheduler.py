@@ -299,9 +299,11 @@ async def refresh_account_sources(context_or_app) -> int:
     refreshed = 0
     for s in sources:
         db_path = s["db_path"] or account_source.source_db_path(s["id"])
+        start = s["parse_start"] if "parse_start" in s.keys() else 1
         try:
             res = await loop.run_in_executor(
-                None, account_source.refresh_account, s["account"], db_path
+                None, account_source.refresh_account, s["account"], db_path,
+                account_source.PARSE_LIMIT, start,
             )
             refreshed += 1
             logger.info("Источник %s (@%s): +%s новых", s["id"], res["username"], res["added"])
