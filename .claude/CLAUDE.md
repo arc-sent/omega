@@ -50,11 +50,21 @@ python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader
 без запуска polling — этого достаточно для smoke-теста хендлеров.
 
 ## Источники-аккаунты (парсер встроен — Фаза 3 сделана)
-- `sources.kind` = 'db' (внешний путь) | 'account' (TikTok, бот парсит сам).
+- `sources.kind` = 'db' (внешний путь) | 'account' (бот парсит сам).
+- `sources.platform` = 'tiktok' | 'youtube' (только для kind='account'). Хранится
+  ник (`account`), платформа задаёт, как его разбирать при обновлении.
 - Для account: `sources.account` = ник, `db_path` = data/sources/<id>.db (ведёт бот).
 - `parser_tiktok.py` — копия парсера из проекта «парсер» (не редактировать по мелочи,
   синхронизировать с оригиналом при изменениях). `account_source.py` — обёртка:
-  refresh_account(account, db_path) прогоняет yt-dlp→embed и пишет в базу источника.
+  refresh_account(account, db_path, ..., platform) прогоняет yt-dlp→(embed|быстрый режим)
+  и пишет в базу источника. normalize_account возвращает (username, url, platform).
+- YouTube: собирается вкладка /shorts канала. Длительность есть только в «глубоком»
+  режиме (extract_flat=False, заходим в каждый Shorts) — он часто требует куки, иначе
+  бот-чек и откат на быстрый режим без длительности. TikTok — плоский режим, при сбое
+  по нику откат на embed-страницу.
+- Куки для YouTube — из локального `cookies.txt` (Netscape) в корне проекта; путь
+  переопределяется env `YT_COOKIES_FILE`. Резолв: `parser_tiktok.resolve_cookiefile`
+  (парсинг) и `downloader._resolve_cookiefile` (скачивание Shorts).
 - До-парсинг: `scheduler.refresh_account_sources` вызывается в daily_plan_job (раз в
   сутки перед раскладкой) и в restore_and_schedule (при старте). Плюс кнопка
   «🔄 Обновить» в источнике (bot._refresh_source). Прогон парсера — в executor (блокирующий).
@@ -62,4 +72,5 @@ python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader
 
 ## Не сделано
 - Лимит длительности в .env (сейчас захардкожен в downloader.py, как в исходном боте).
-- Парсер только TikTok (наследие исходного проекта).
+- Парсер: TikTok + YouTube Shorts. Другие платформы (Likee и т.п.) как источник-аккаунт
+  не поддержаны (скачивание Likee/VK есть, но парсинга списка по аккаунту нет).

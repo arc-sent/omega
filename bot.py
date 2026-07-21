@@ -314,7 +314,9 @@ def sources_kb(telegram_id: int) -> InlineKeyboardMarkup:
     rows = []
     for s in db.get_sources(telegram_id):
         if s["kind"] == "account":
-            label = f"🎵 {s['name']} (@{s['account']})"
+            plat = s["platform"] if "platform" in s.keys() else "tiktok"
+            icon = "🎬" if plat == "youtube" else "🎵"
+            label = f"{icon} {s['name']} (@{s['account']})"
         else:
             label = f"🗄 {s['name']}" + (f" · @{s['username']}" if s["username"] else "")
         rows.append([InlineKeyboardButton(label, callback_data="noop")])
@@ -404,11 +406,12 @@ async def _refresh_source(query, source_id: int) -> None:
     await query.edit_message_text(f"⏳ Парсю @{s['account']}…")
     path = s["db_path"] or account_source.source_db_path(source_id)
     start = s["parse_start"] if "parse_start" in s.keys() else 1
+    platform = s["platform"] if "platform" in s.keys() else "tiktok"
     loop = asyncio.get_running_loop()
     try:
         res = await loop.run_in_executor(
             None, account_source.refresh_account, s["account"], path,
-            account_source.PARSE_LIMIT, start,
+            account_source.PARSE_LIMIT, start, platform,
         )
         note = f"✅ @{res['username']}: всего {res['total']}, новых {res['added']} (старт {start})."
     except Exception as exc:
@@ -421,6 +424,7 @@ async def sources_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["src_name"] = update.message.text.strip()
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎵 TikTok-аккаунт (бот парсит сам)", callback_data="src_type_account")],
+        [InlineKeyboardButton("🎬 YouTube Shorts-канал (бот парсит сам)", callback_data="src_type_youtube")],
         [InlineKeyboardButton("🗄 Готовая база парсера (файл .db)", callback_data="src_type_db")],
     ])
     await update.message.reply_text("Какой это источник?", reply_markup=kb)
@@ -431,9 +435,17 @@ async def sources_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     query = update.callback_query
     await query.answer()
     if query.data == "src_type_account":
+        context.user_data["src_platform"] = "tiktok"
         await query.edit_message_text(
             "Пришли ссылку или @ник TikTok-аккаунта, который парсить.\n"
             "Например: https://www.tiktok.com/@batek.official или @batek.official"
+        )
+        return SRC_ACCOUNT
+    if query.data == "src_type_youtube":
+        context.user_data["src_platform"] = "youtube"
+        await query.edit_message_text(
+            "Пришли ссылку или @ник YouTube-канала (собираются Shorts).\n"
+            "Например: https://www.youtube.com/@MrBeast или @MrBeast"
         )
         return SRC_ACCOUNT
     await query.edit_message_text(
@@ -445,8 +457,9 @@ async def sources_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def sources_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     raw = update.message.text.strip()
+    platform = context.user_data.get("src_platform", "tiktok")
     try:
-        username, _ = account_source.normalize(raw)
+        username, _, platform = account_source.normalize(raw, platform)
     except ValueError as e:
         await update.message.reply_text(f"❌ {e}\nПришли корректную ссылку/ник или /cancel.")
         return SRC_ACCOUNT
@@ -454,14 +467,17 @@ async def sources_account(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     telegram_id = update.effective_user.id
     # Заводим источник, затем проставляем путь к его базе (нужен id).
     sid = db.add_source(telegram_id, context.user_data["src_name"], "", None,
-                        kind="account", account=username)
+                        kind="account", account=username, platform=platform)
     path = account_source.source_db_path(sid)
     db.set_source_db_path(sid, path)
 
     await update.message.reply_text(f"⏳ Первый парсинг @{username}…")
     loop = asyncio.get_running_loop()
     try:
-        res = await loop.run_in_executor(None, account_source.refresh_account, username, path)
+        res = await loop.run_in_executor(
+            None, account_source.refresh_account, username, path,
+            account_source.PARSE_LIMIT, 1, platform,
+        )
         note = f"✅ Источник добавлен. Собрано ссылок: {res['total']} (новых {res['added']})."
     except Exception as exc:
         note = (f"⚠️ Источник добавлен, но первый парсинг не удался:\n{exc}\n"
@@ -998,7 +1014,7 @@ def main() -> None:
         ],
         states={
             SRC_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_name)],
-            SRC_TYPE: [CallbackQueryHandler(sources_type, pattern=r"^src_type_(account|db)$")],
+            SRC_TYPE: [CallbackQueryHandler(sources_type, pattern=r"^src_type_(account|youtube|db)$")],
             SRC_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_account)],
             SRC_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_path)],
             SRC_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_user)],

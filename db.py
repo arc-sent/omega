@@ -56,7 +56,8 @@ def init_db() -> None:
                 db_path     TEXT NOT NULL,       -- путь к SQLite-базе с видео
                 username    TEXT,                -- фильтр по нику внутри базы (опц.)
                 kind        TEXT NOT NULL DEFAULT 'db',  -- 'db' | 'account'
-                account     TEXT,                -- ник/ссылка TikTok (для kind='account')
+                account     TEXT,                -- ник/ссылка (для kind='account')
+                platform    TEXT NOT NULL DEFAULT 'tiktok',  -- 'tiktok' | 'youtube' (для kind='account')
                 backfill_done INTEGER NOT NULL DEFAULT 0,  -- 1 = вся история аккаунта уже собрана
                 parse_start INTEGER NOT NULL DEFAULT 1,    -- с какого ролика парсить (1-based; kind='account')
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -141,6 +142,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sources ADD COLUMN kind TEXT NOT NULL DEFAULT 'db'")
         if "account" not in cols:
             conn.execute("ALTER TABLE sources ADD COLUMN account TEXT")
+        if "platform" not in cols:
+            conn.execute(
+                "ALTER TABLE sources ADD COLUMN platform TEXT NOT NULL DEFAULT 'tiktok'"
+            )
         if "backfill_done" not in cols:
             conn.execute(
                 "ALTER TABLE sources ADD COLUMN backfill_done INTEGER NOT NULL DEFAULT 0"
@@ -249,13 +254,13 @@ def get_source(source_id: int) -> sqlite3.Row | None:
 
 def add_source(
     telegram_id: int, name: str, db_path: str, username: str | None,
-    *, kind: str = "db", account: str | None = None,
+    *, kind: str = "db", account: str | None = None, platform: str = "tiktok",
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO sources (telegram_id, name, db_path, username, kind, account) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (telegram_id, name, db_path, username, kind, account),
+            "INSERT INTO sources (telegram_id, name, db_path, username, kind, account, platform) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (telegram_id, name, db_path, username, kind, account, platform),
         )
         return cur.lastrowid
 
