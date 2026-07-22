@@ -29,53 +29,36 @@ def source_db_path(source_id: int) -> str:
     return os.path.join(SOURCES_DIR, f"{source_id}.db")
 
 
-def normalize(account: str, platform: str | None = None) -> tuple[str, str, str]:
-    """(username, profile_url, platform) из ссылки/ника.
-
-    platform — подсказка для голого ника без ссылки ('tiktok' | 'youtube').
-    Бросает ValueError при мусоре.
-    """
-    return pt.normalize_account(account, platform)
+def normalize(account: str) -> tuple[str, str]:
+    """(username, profile_url) из ссылки/ника. Бросает ValueError при мусоре."""
+    return pt.normalize_account(account)
 
 
-def _fetch(account: str, limit: int, start: int = 1,
-           platform: str | None = None) -> tuple[str, list, str, str]:
+def _fetch(account: str, limit: int, start: int = 1) -> tuple[str, list, str]:
     """Собрать `limit` роликов начиная со `start`-го (1-based, новые→старые).
 
     start=1 — с самого свежего; start=20 — пропустить 19 свежих. Вернуть
-    (username, entries, source, platform).
-
-    Для YouTube идём в глубоком режиме (за длительностью Shorts), с куки из
-    локального cookies.txt; при бот-чеке откатываемся на быстрый режим без
-    длительности. Для TikTok по нику при сбое yt-dlp пробуем embed-страницу.
+    (username, entries, source).
     """
-    username, profile_url, plat = pt.normalize_account(account, platform)
+    username, profile_url = pt.normalize_account(account)
     is_username_form = profile_url.startswith("https://")
-    cookiefile = pt.resolve_cookiefile()
 
     source = "yt-dlp"
-    deep = plat == "youtube"
     try:
-        entries = pt.fetch_videos(profile_url, limit, start,
-                                  extract_flat=not deep, cookiefile=cookiefile)
+        entries = pt.fetch_videos(profile_url, limit, start)
     except (pt.ExtractionError, pt.DownloadError, pt.ExtractorError):
-        if plat == "youtube" and deep:
-            # Глубокий режим заблокирован бот-чеком — берём быстрый плоский
-            # список (Shorts соберутся, но без длительности).
-            entries = pt.fetch_videos(profile_url, limit, start,
-                                      extract_flat=True, cookiefile=cookiefile)
-        elif plat == "tiktok" and is_username_form:
-            entries = pt.fetch_videos_embed(username, limit, start)
-            source = "embed"
-        else:
+        # yt-dlp не справился — для запуска по нику пробуем embed-страницу.
+        if not is_username_form:
             raise
-    return username, entries, source, plat
+        entries = pt.fetch_videos_embed(username, limit, start)
+        source = "embed"
+    return username, entries, source
 
 
-def _save(username: str, db_path: str, entries: list, platform: str = "tiktok") -> int:
+def _save(username: str, db_path: str, entries: list) -> int:
     conn = pt.init_db(db_path)
     try:
-        return pt.save_videos(conn, username, entries, platform=platform)
+        return pt.save_videos(conn, username, entries)
     finally:
         conn.close()
 
@@ -95,25 +78,22 @@ def count_videos(db_path: str) -> int:
 
 
 def refresh_account(account: str, db_path: str, limit: int = PARSE_LIMIT,
-                    start: int = 1, platform: str | None = None) -> dict:
+                    start: int = 1) -> dict:
     """Спарсить аккаунт и дописать новые видео в базу источника.
 
     start (1-based) — с какого ролика начинать (1 = с самого свежего). Позволяет
-    пропустить N свежих роликов и парсить окно старее. platform ('tiktok' |
-    'youtube') — подсказка для голого ника. Возвращает
-    {username, added, total, source, platform}. Бросает исключения парсера, если
-    ни yt-dlp, ни embed не смогли собрать видео.
+    пропустить N свежих роликов и парсить окно старее. Возвращает
+    {username, added, total, source}. Бросает исключения парсера, если ни
+    yt-dlp, ни embed не смогли собрать видео.
     """
-    username, entries, source, plat = _fetch(account, limit, start, platform)
-    added = _save(username, db_path, entries, plat)
-    logger.info("Парсинг @%s [%s]: старт %s, всего %s, новых %s (источник %s)",
-                username, plat, start, len(entries), added, source)
-    return {"username": username, "added": added, "total": len(entries),
-            "source": source, "platform": plat}
+    username, entries, source = _fetch(account, limit, start)
+    added = _save(username, db_path, entries)
+    logger.info("Парсинг @%s: старт %s, всего %s, новых %s (источник %s)",
+                username, start, len(entries), added, source)
+    return {"username": username, "added": added, "total": len(entries), "source": source}
 
 
-def deepen_account(account: str, db_path: str, step: int = PARSE_STEP,
-                   platform: str | None = None) -> dict:
+def deepen_account(account: str, db_path: str, step: int = PARSE_STEP) -> dict:
     """Углубиться в историю: запросить (текущее число + step) роликов от верха.
 
     Список TikTok идёт новыми→старыми, поэтому берём от верха окно шире того, что
@@ -125,14 +105,13 @@ def deepen_account(account: str, db_path: str, step: int = PARSE_STEP,
     can_deepen (источник умеет уходить глубже — только yt-dlp, не embed).
     """
     limit = count_videos(db_path) + step
-    username, entries, source, plat = _fetch(account, limit, platform=platform)
-    added = _save(username, db_path, entries, plat)
+    username, entries, source = _fetch(account, limit)
+    added = _save(username, db_path, entries)
     exhausted = source == "yt-dlp" and len(entries) < limit
-    logger.info("Углубление @%s [%s]: просили %s, получили %s, новых %s%s",
-                username, plat, limit, len(entries), added,
+    logger.info("Углубление @%s: просили %s, получили %s, новых %s%s",
+                username, limit, len(entries), added,
                 " (дно аккаунта)" if exhausted else "")
     return {
         "username": username, "added": added, "total": len(entries),
-        "source": source, "platform": plat,
-        "exhausted": exhausted, "can_deepen": source == "yt-dlp",
+        "source": source, "exhausted": exhausted, "can_deepen": source == "yt-dlp",
     }

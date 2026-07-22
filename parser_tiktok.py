@@ -29,88 +29,40 @@ except ImportError:
     sys.exit(1)
 
 
-def _parse_youtube(raw: str):
-    """Из ссылки/ника YouTube получить (username, shorts_url, 'youtube').
-
-    Собираем именно вкладку Shorts канала (.../shorts). Поддерживаются:
-      - https://www.youtube.com/@handle[/...]
-      - https://www.youtube.com/channel/UCxxxx | /c/Name | /user/Name
-      - @handle / handle   (голый ник)
-    """
-    # Полная ссылка с @handle
-    m = re.search(r"youtube\.com/@([\w.\-]+)", raw, re.IGNORECASE)
-    if m:
-        handle = m.group(1)
-        return handle, f"https://www.youtube.com/@{handle}/shorts", "youtube"
-
-    # Legacy-форматы канала: /channel/UC..., /c/Name, /user/Name
-    m = re.search(r"youtube\.com/(channel|c|user)/([\w.\-]+)", raw, re.IGNORECASE)
-    if m:
-        seg, name = m.group(1), m.group(2)
-        return name, f"https://www.youtube.com/{seg}/{name}/shorts", "youtube"
-
-    # Голый ник (со @ или без)
-    handle = raw.lstrip("@")
-    if not handle or "/" in handle:
-        raise ValueError(f"Не удалось определить YouTube-канал из: {raw!r}")
-    return handle, f"https://www.youtube.com/@{handle}/shorts", "youtube"
-
-
-def normalize_account(raw: str, platform: str | None = None):
-    """Из ссылки/username/channel_id получить (username, input_url, platform).
-
-    Платформа определяется автоматически по ссылке/префиксу. Для голого ника
-    без ссылки используется значение `platform` (по умолчанию 'tiktok').
+def normalize_account(raw: str):
+    """Из ссылки/username/channel_id получить (username, input_url).
 
     Поддерживаются форматы:
-      TikTok:
-        - https://www.tiktok.com/@username
-        - @username / username
-        - tiktokuser:1234567890  (обход ошибки "Unable to extract secondary user ID")
-        - 1234567890             (голый числовой channel_id)
-      YouTube (только вкладка Shorts):
-        - https://www.youtube.com/@handle[/shorts]
-        - https://www.youtube.com/channel|c|user/<name>
-        - youtube:@handle / yt:@handle  (явный префикс для голого ника)
+      - https://www.tiktok.com/@username
+      - @username / username
+      - tiktokuser:1234567890  (обход ошибки "Unable to extract secondary user ID")
+      - 1234567890             (голый числовой channel_id)
     """
     raw = raw.strip()
 
-    # Явный обход TikTok через channel_id, как советует yt-dlp
+    # Явный обход через channel_id, как советует yt-dlp
     m = re.match(r"tiktokuser:(\d+)$", raw, re.IGNORECASE)
     if m:
         channel_id = m.group(1)
-        return channel_id, f"tiktokuser:{channel_id}", "tiktok"
+        return channel_id, f"tiktokuser:{channel_id}"
 
-    # Явный префикс YouTube для голого ника: youtube:@handle / yt:@handle
-    m = re.match(r"(?:youtube|yt):(.+)$", raw, re.IGNORECASE)
-    if m:
-        return _parse_youtube(m.group(1).strip())
-
-    # Ссылка на YouTube
-    if re.search(r"(youtube\.com|youtu\.be)", raw, re.IGNORECASE):
-        return _parse_youtube(raw)
-
-    # Ссылка на TikTok
-    if re.search(r"tiktok\.com", raw, re.IGNORECASE):
-        m = re.search(r"tiktok\.com/@([\w.\-]+)", raw, re.IGNORECASE)
-        if not m:
-            raise ValueError(f"Не удалось определить username из: {raw!r}")
-        username = m.group(1)
-        return username, f"https://www.tiktok.com/@{username}", "tiktok"
-
-    # Голый числовой channel_id -> TikTok
+    # Голый числовой channel_id
     if raw.isdigit():
-        return raw, f"tiktokuser:{raw}", "tiktok"
+        return raw, f"tiktokuser:{raw}"
 
-    # Голый ник без ссылки — платформа берётся из аргумента (по умолчанию TikTok)
-    plat = (platform or "tiktok").lower()
-    if plat == "youtube":
-        return _parse_youtube(raw)
+    # Полная ссылка на профиль
+    m = re.search(r"tiktok\.com/@([\w.\-]+)", raw, re.IGNORECASE)
+    if m:
+        username = m.group(1)
+    else:
+        # Просто username (со @ или без)
+        username = raw.lstrip("@")
 
-    username = raw.lstrip("@")
     if not username or "/" in username:
         raise ValueError(f"Не удалось определить username из: {raw!r}")
-    return username, f"https://www.tiktok.com/@{username}", "tiktok"
+
+    url = f"https://www.tiktok.com/@{username}"
+    return username, url
 
 
 # --- Собственный парсер по нику (через embed-страницу TikTok) -----------------
@@ -230,17 +182,14 @@ def init_db(db_path: str) -> sqlite3.Connection:
             url         TEXT NOT NULL,
             title       TEXT,
             duration    INTEGER,
-            platform    TEXT,
             found_at    TEXT NOT NULL
         )
         """
     )
-    # Миграция старых баз, созданных без колонок duration / platform
+    # Миграция старых баз, созданных без колонки duration
     cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
     if "duration" not in cols:
         conn.execute("ALTER TABLE videos ADD COLUMN duration INTEGER")
-    if "platform" not in cols:
-        conn.execute("ALTER TABLE videos ADD COLUMN platform TEXT")
     conn.commit()
     return conn
 
@@ -266,34 +215,12 @@ class ExtractionError(Exception):
     """Не удалось получить список видео (yt-dlp вернул ошибку экстрактора)."""
 
 
-def resolve_cookiefile() -> str | None:
-    """Путь к cookies.txt (Netscape) для yt-dlp или None, если файла нет.
-
-    Куки берутся из локальной папки проекта — нужны для YouTube, чтобы обойти
-    бот-чек и получить длительность Shorts. Путь можно переопределить через
-    переменную окружения YT_COOKIES_FILE; иначе ищем cookies.txt рядом со
-    скриптом (в корне проекта).
-    """
-    raw = os.environ.get("YT_COOKIES_FILE")
-    if raw and raw.strip():
-        path = raw.strip()
-        return path if os.path.isfile(path) else None
-    default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-    return default if os.path.isfile(default) else None
-
-
-def fetch_videos(profile_url: str, limit: int, start: int = 1,
-                 extract_flat: bool = True, cookiefile: str | None = None):
+def fetch_videos(profile_url: str, limit: int, start: int = 1):
     """Вернуть список entries (dict) без скачивания видео.
 
     start (1-based) — с какого ролика списка (новые→старые) начинать: 1 = с
     самого свежего, 20 = пропустить 19 свежих и взять окно начиная с 20-го.
     limit — размер окна (сколько роликов взять начиная со start).
-
-    extract_flat=True — быстрый режим (только список; у TikTok сразу есть
-    duration). extract_flat=False — заходить в каждое видео за метаданными
-    (нужно для YouTube, где duration нет в плоском списке); медленнее.
-    cookiefile — путь к cookies.txt (Netscape) для обхода бот-чека YouTube.
 
     Отличает «профиль не распарсился» (ExtractionError) от «профиль пустой»
     (пустой список без ошибок). Ошибки yt-dlp перехватываются через logger,
@@ -316,7 +243,7 @@ def fetch_videos(profile_url: str, limit: int, start: int = 1,
             collected_errors.append(str(msg))
 
     ydl_opts = {
-        "extract_flat": extract_flat,  # True — не заходить в каждое видео
+        "extract_flat": True,   # не заходить в каждое видео, не скачивать
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
@@ -325,8 +252,6 @@ def fetch_videos(profile_url: str, limit: int, start: int = 1,
         "playlistend": start + limit - 1,   # по какой (включительно) — окно из limit штук
         "logger": _Logger(),
     }
-    if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile  # Netscape cookies.txt — обход бот-чека YouTube
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(profile_url, download=False)
 
@@ -454,7 +379,6 @@ def save_videos(
     username: str,
     entries: list,
     txt_path: str | None = None,
-    platform: str = "tiktok",
 ) -> int:
     """INSERT OR IGNORE; вернуть количество реально добавленных строк.
 
@@ -471,14 +395,9 @@ def save_videos(
         if not video_id:
             continue
 
-        if platform == "youtube":
-            # В глубоком режиме e["url"] — прямая медиа-ссылка; берём канонический
-            # адрес Shorts по id, чтобы в БД лежала нормальная веб-ссылка.
-            url = f"https://www.youtube.com/shorts/{video_id}"
-        else:
-            url = e.get("url") or e.get("webpage_url")
-            if not url:
-                url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+        url = e.get("url") or e.get("webpage_url")
+        if not url:
+            url = f"https://www.tiktok.com/@{username}/video/{video_id}"
 
         title = e.get("title") or e.get("description")
         duration = e.get("duration")  # секунды; None у embed-парсера
@@ -486,10 +405,10 @@ def save_videos(
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO videos
-                (tt_video_id, username, url, title, duration, platform, found_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (tt_video_id, username, url, title, duration, found_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (str(video_id), username, url, title, duration, platform, found_at),
+            (str(video_id), username, url, title, duration, found_at),
         )
         added += cur.rowcount  # 1 если вставлено, 0 если UNIQUE-конфликт
 
@@ -562,35 +481,18 @@ def main() -> int:
         "--resolve-only", action="store_true",
         help="Только определить channel_id по нику и выйти (без сбора видео)",
     )
-    parser.add_argument(
-        "--platform", choices=["tiktok", "youtube"], default=None,
-        help="Платформа для голого ника без ссылки (по умолчанию tiktok). "
-             "Для ссылок платформа определяется автоматически.",
-    )
-    parser.add_argument(
-        "--cookies-file", default=None,
-        help="Путь к cookies.txt (Netscape). Нужен для YouTube, чтобы обойти "
-             "бот-чек и получить длительность Shorts. Можно задать через env "
-             "YT_COOKIES_FILE; по умолчанию берётся cookies.txt рядом со скриптом.",
-    )
     args = parser.parse_args()
 
-    cookiefile = args.cookies_file or resolve_cookiefile()
-
     try:
-        username, profile_url, platform = normalize_account(args.account, args.platform)
+        username, profile_url = normalize_account(args.account)
     except ValueError as e:
         print(f"Ошибка: {e}", file=sys.stderr)
         return 1
 
     is_username_form = profile_url.startswith("https://")
 
-    # Режим "только резолв" (channel_id) поддержан только для TikTok
+    # Режим "только резолв"
     if args.resolve_only:
-        if platform == "youtube":
-            print("Режим --resolve-only поддержан только для TikTok "
-                  "(YouTube-канал yt-dlp читает напрямую).", file=sys.stderr)
-            return 1
         if not is_username_form:
             print(f"channel_id: {username}")
             return 0
@@ -606,35 +508,13 @@ def main() -> int:
     db_path = args.db or f"{username}.db"
     source = "yt-dlp"
 
-    # Получение списка видео. Для YouTube — глубокий режим (заходим в каждый
-    # Shorts за длительностью), т.к. в плоском списке duration отсутствует.
-    deep = platform == "youtube"
-    if deep:
-        print(f"YouTube: собираю длительность по каждому видео "
-              f"(до {args.limit} шт.), это медленнее...", file=sys.stderr)
+    # Получение списка видео
     try:
-        entries = fetch_videos(profile_url, args.limit, args.start,
-                               extract_flat=not deep, cookiefile=cookiefile)
+        entries = fetch_videos(profile_url, args.limit, args.start)
     except (ExtractionError, DownloadError, ExtractorError) as e:
-        # YouTube: глубокий сбор часто блокируется бот-чеком без кук. Откатываемся
-        # на быстрый плоский список (без длительности), чтобы Shorts всё же собрать.
-        if platform == "youtube" and deep:
-            print(f"YouTube не отдал длительность в глубоком режиме "
-                  f"({_clean(str(e))[:120]}).", file=sys.stderr)
-            if not cookiefile:
-                print("Совет: для длительности положите cookies.txt рядом со "
-                      "скриптом или задайте --cookies-file.", file=sys.stderr)
-            print("Откат на быстрый режим (без длительности)...", file=sys.stderr)
-            try:
-                entries = fetch_videos(profile_url, args.limit, args.start,
-                                       extract_flat=True, cookiefile=cookiefile)
-                deep = False
-            except (ExtractionError, DownloadError, ExtractorError) as e2:
-                print(f"Ошибка: {describe_error(e2)}", file=sys.stderr)
-                return 1
-        # TikTok: если запуск был по нику, переключаемся на собственный парсер
-        # (embed-страница), который тут работает без куки.
-        elif platform == "tiktok" and is_username_form:
+        # yt-dlp не справился. Если запуск был по нику — переключаемся на
+        # собственный парсер (embed-страница), который тут работает без куки.
+        if is_username_form:
             print(f"yt-dlp не смог собрать видео ({_clean(str(e))[:120]}).",
                   file=sys.stderr)
             print(f"Переключаюсь на собственный парсер (embed) для @{username}...",
@@ -648,21 +528,9 @@ def main() -> int:
         else:
             print(f"Ошибка: {describe_error(e)}", file=sys.stderr)
             return 1
-    except Exception as e:  # сеть, куки и прочее — не роняем скрипт
-        if platform == "youtube" and deep:
-            print(f"Глубокий режим YouTube не сработал ({str(e)[:120]}).",
-                  file=sys.stderr)
-            print("Откат на быстрый режим (без длительности)...", file=sys.stderr)
-            try:
-                entries = fetch_videos(profile_url, args.limit, args.start,
-                                       extract_flat=True, cookiefile=cookiefile)
-                deep = False
-            except Exception as e2:
-                print(f"Непредвиденная ошибка при запросе: {e2}", file=sys.stderr)
-                return 1
-        else:
-            print(f"Непредвиденная ошибка при запросе: {e}", file=sys.stderr)
-            return 1
+    except Exception as e:  # сеть и прочее — не роняем скрипт
+        print(f"Непредвиденная ошибка при запросе: {e}", file=sys.stderr)
+        return 1
 
     if not entries:
         print(f"Профиль @{username} открыт, но видео не найдено (пустой или приватный аккаунт).")
@@ -676,10 +544,6 @@ def main() -> int:
         if source == "embed":
             print("Прим.: embed не отдаёт длительность — фильтр по секундам к нему "
                   "не применяется (такие видео проходят как есть).", file=sys.stderr)
-        elif platform == "youtube" and not deep:
-            print("Прим.: длительность YouTube получить не удалось (нужны куки) — "
-                  "фильтр по секундам не применяется, видео проходят как есть.",
-                  file=sys.stderr)
         entries = filter_by_duration(entries, min_sec, max_sec)
 
     if not entries:
@@ -693,12 +557,11 @@ def main() -> int:
     txt_path = resolve_txt_path(db_path)
     conn = init_db(db_path)
     try:
-        added = save_videos(conn, username, entries, txt_path, platform)
+        added = save_videos(conn, username, entries, txt_path)
     finally:
         conn.close()
 
     print(f"Аккаунт:         @{username}")
-    print(f"Платформа:       {platform}")
     print(f"Источник:        {source}")
     print(f"Найдено видео:   {total_found}")
     if min_sec is not None or max_sec is not None:

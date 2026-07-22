@@ -86,32 +86,14 @@ def detect_platform(url: str) -> str | None:
 
 # ─── Универсальный загрузчик через yt-dlp (TikTok, YouTube Shorts) ────────────
 
-def _resolve_cookiefile() -> str | None:
-    """Путь к cookies.txt (Netscape) из локальной папки проекта или None.
-
-    Переопределяется переменной окружения YT_COOKIES_FILE; иначе берётся
-    cookies.txt рядом с этим модулем. Нужен для YouTube (обход бот-чека).
-    """
-    raw = os.environ.get("YT_COOKIES_FILE")
-    if raw and raw.strip():
-        path = raw.strip()
-        return path if os.path.isfile(path) else None
-    default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-    return default if os.path.isfile(default) else None
-
-
 def _download_ytdlp_sync(
     url: str,
     save_path: str | None,
     prefix: str,
     default_title: str,
-    cookiefile: str | None = None,
 ) -> tuple[str, str]:
     # Фаза 1: получаем метаданные без скачивания — проверяем длительность
-    meta_opts = {"quiet": True, "no_warnings": True}
-    if cookiefile:
-        meta_opts["cookiefile"] = cookiefile
-    with yt_dlp.YoutubeDL(meta_opts) as ydl:
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
         meta = ydl.extract_info(url, download=False)
     _check_duration(meta.get("duration"))
 
@@ -132,8 +114,6 @@ def _download_ytdlp_sync(
         # загрузок не будут конкурировать за один и тот же кэш-файл.
         "cachedir": os.path.join(tmpdir, ".cache"),
     }
-    if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         expected = ydl.prepare_filename(info)
@@ -168,8 +148,7 @@ async def download_youtube(url: str, save_path: str | None = None) -> tuple[str,
     Возвращает (путь к файлу, название)."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, _download_ytdlp_sync, url, save_path, "youtube", "YouTube Video",
-        _resolve_cookiefile(),
+        None, _download_ytdlp_sync, url, save_path, "youtube", "YouTube Video"
     )
 
 

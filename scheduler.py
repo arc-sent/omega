@@ -300,17 +300,16 @@ async def refresh_account_sources(context_or_app) -> int:
     for s in sources:
         db_path = s["db_path"] or account_source.source_db_path(s["id"])
         start = s["parse_start"] if "parse_start" in s.keys() else 1
-        platform = s["platform"] if "platform" in s.keys() else "tiktok"
         try:
             res = await loop.run_in_executor(
                 None, account_source.refresh_account, s["account"], db_path,
-                account_source.PARSE_LIMIT, start, platform,
+                account_source.PARSE_LIMIT, start,
             )
             refreshed += 1
             logger.info("Источник %s (@%s): +%s новых", s["id"], res["username"], res["added"])
         except Exception as exc:
             logger.exception("Не удалось спарсить источник %s (%s)", s["id"], s["account"])
-            _record_error(s["telegram_id"], exc, stage="парсинг аккаунта", platform=platform)
+            _record_error(s["telegram_id"], exc, stage="парсинг аккаунта", platform="tiktok")
     return refreshed
 
 
@@ -366,7 +365,6 @@ async def ensure_backlog(context_or_app) -> int:
         if not src_rules:
             continue  # нет активных правил — нечему заканчиваться
         db_path = src["db_path"] or account_source.source_db_path(src["id"])
-        platform = src["platform"] if "platform" in src.keys() else "tiktok"
         # запас на столько дней по самому «прожорливому» правилу источника
         need = max(r["videos_per_day"] for r in src_rules) * BACKLOG_DAYS
 
@@ -379,14 +377,13 @@ async def ensure_backlog(context_or_app) -> int:
                 break  # запаса хватает
             try:
                 res = await loop.run_in_executor(
-                    None, account_source.deepen_account, src["account"], db_path,
-                    account_source.PARSE_STEP, platform,
+                    None, account_source.deepen_account, src["account"], db_path
                 )
             except Exception as exc:
                 logger.exception("Не удалось углубить источник %s (%s)",
                                  src["id"], src["account"])
                 _record_error(src["telegram_id"], exc,
-                              stage="допарсинг истории", platform=platform)
+                              stage="допарсинг истории", platform="tiktok")
                 break
             deepened += 1
             logger.info("Источник %s (@%s): углубление +%s новых (запас был %s/%s)",
