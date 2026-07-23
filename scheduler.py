@@ -443,13 +443,18 @@ async def _publish_job(context) -> None:
 
         file_path, title = await _download(url, vk_token)
         title = post["title"] or title
+        sent_description = post["description"] or ""
         await _publish_to_vk(telegram_id, vk_token, vk_group_id, file_path,
-                             title, post["description"] or "")
+                             title, sent_description)
 
         db.mark_published(rule_id, post["tt_video_id"])
+        # Диагностика описания: показываем владельцу, что реально ушло в VK как
+        # описание для КАЖДОГО ролика (чтобы отличить потерю на нашей стороне от
+        # того, что VK не показал текст). Можно убрать после разбора.
+        desc_note = f"📝 {sent_description[:60]}" if sent_description else "📝 (пусто)"
         try:
             await context.bot.send_message(
-                telegram_id, f"✅ Опубликовано в «{group_name}»: {url}"
+                telegram_id, f"✅ Опубликовано в «{group_name}»: {url}\n{desc_note}"
             )
         except Exception:
             pass

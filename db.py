@@ -499,6 +499,22 @@ def add_scheduled_post(
         return cur.lastrowid
 
 
+def update_scheduled_posts_description(rule_id: int, description: str | None) -> int:
+    """Обновить описание у ещё не опубликованных постов правила в очереди.
+
+    Описание замораживается в scheduled_posts в момент планирования. Если
+    пользователь меняет описание правила уже ПОСЛЕ того, как сегодняшняя квота
+    разложена (типичный сценарий: создал правило → оно сразу спланировалось с
+    пустым описанием → потом задал текст), эти строки надо обновить, иначе они
+    уйдут в VK со старым/пустым описанием. Возвращает число обновлённых строк."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE scheduled_posts SET description = ? WHERE rule_id = ?",
+            (description, rule_id),
+        )
+        return cur.rowcount
+
+
 def get_scheduled_posts() -> list[sqlite3.Row]:
     with _connect() as conn:
         return conn.execute("SELECT * FROM scheduled_posts ORDER BY publish_at").fetchall()

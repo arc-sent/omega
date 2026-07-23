@@ -710,7 +710,16 @@ async def rule_edit_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             db.update_rule(rid, slots=",".join(str(h) for h in hours))
     elif field == "desc":
-        db.update_rule(rid, description=None if text == "-" else text)
+        new_desc = None if text == "-" else text
+        db.update_rule(rid, description=new_desc)
+        # Описание замораживается в очереди в момент планирования. Если сегодняшняя
+        # квота уже разложена (правило планируется сразу при создании), обновляем
+        # ещё не опубликованные посты — иначе они уйдут со старым/пустым описанием.
+        synced = db.update_scheduled_posts_description(rid, new_desc)
+        if synced:
+            await update.message.reply_text(
+                f"📝 Описание обновлено и применено к {synced} уже запланированным постам."
+            )
     elif field == "dur":
         lo, hi, err = _parse_duration_input(text)
         if err:
