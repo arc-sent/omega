@@ -5,6 +5,9 @@ services:
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - ADMIN_IDS=${ADMIN_IDS}
+      # Ключ шифрования VK-токенов. Если задан — используется вместо data/token.key.
+      # Менять после того, как токены уже зашифрованы, нельзя (расшифровка сломается).
+      - TOKEN_KEY=${TOKEN_KEY:-}
       - VK_PUBLISH_CONCURRENCY=${VK_PUBLISH_CONCURRENCY:-1}
       - VK_PUBLISH_RETRIES=${VK_PUBLISH_RETRIES:-3}
       - VK_RETRY_BASE_DELAY=${VK_RETRY_BASE_DELAY:-3}
