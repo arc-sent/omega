@@ -10,7 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py db.py vk.py scheduler.py source_reader.py downloader.py \
-     account_source.py parser_tiktok.py ./
+     account_source.py parser_tiktok.py crypto.py ./
 
 ENV DATA_DIR=/app/data
 VOLUME ["/app/data"]
