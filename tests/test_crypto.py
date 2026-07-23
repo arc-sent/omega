@@ -21,6 +21,19 @@ def test_encrypt_idempotent():
     assert crypto.encrypt(enc) == enc  # уже зашифрованное не шифруется повторно
 
 
+def test_validate_key_rejects_garbage():
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        crypto._validate_key("not-a-real-fernet-key")
+
+
+def test_validate_key_accepts_generated():
+    from cryptography.fernet import Fernet
+
+    crypto._validate_key(Fernet.generate_key().decode())  # не должно бросать
+
+
 def test_empty_values():
     assert crypto.encrypt("") == ""
     assert crypto.encrypt(None) is None

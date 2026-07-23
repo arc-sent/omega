@@ -38,10 +38,28 @@ except Exception:  # pragma: no cover - зависит от окружения
 _fernet = None  # ленивая инициализация: ключ читаем/создаём при первом обращении
 
 
+def _validate_key(key: str) -> None:
+    """Понятно сообщить, если TOKEN_KEY не является корректным ключом Fernet."""
+    try:
+        Fernet(key.encode())
+    except Exception as exc:
+        raise RuntimeError(
+            "TOKEN_KEY в окружении не является корректным ключом Fernet "
+            "(нужны 32 байта в url-safe base64, 44 символа, оканчивается на '='). "
+            "Сгенерируй правильный: "
+            "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\" "
+            "и впиши БЕЗ кавычек. Либо убери TOKEN_KEY, чтобы использовать data/token.key."
+        ) from exc
+
+
 def _load_or_create_key() -> bytes:
     """Вернуть ключ Fernet: из env TOKEN_KEY, иначе из файла, иначе создать файл."""
     env_key = os.getenv("TOKEN_KEY")
     if env_key:
+        # В .env к значению часто прилипают кавычки/пробелы/перенос строки —
+        # снимаем их, иначе Fernet ругается на «невалидный ключ».
+        env_key = env_key.strip().strip('"').strip("'").strip()
+        _validate_key(env_key)
         return env_key.encode()
     if os.path.isfile(_KEY_FILE):
         with open(_KEY_FILE, "rb") as f:
