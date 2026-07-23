@@ -17,6 +17,8 @@ import re
 import sqlite3
 import time
 
+import crypto
+
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "autopost.db")
@@ -166,6 +168,20 @@ def init_db() -> None:
             "ON scheduled_posts (rule_id, tt_video_id)"
         )
 
+        # Одноразовая миграция: зашифровать уже хранящиеся открытым текстом токены,
+        # чтобы в дампе БД их не было. Безопасно и идемпотентно: encrypt() не трогает
+        # уже зашифрованные значения (префикс enc:), а get_vk_token читает оба вида.
+        for row in conn.execute(
+            "SELECT telegram_id, vk_token FROM users WHERE vk_token IS NOT NULL"
+        ).fetchall():
+            if not crypto.is_encrypted(row["vk_token"]):
+                enc = crypto.encrypt(row["vk_token"])
+                if enc != row["vk_token"]:  # crypto доступен и что-то зашифровалось
+                    conn.execute(
+                        "UPDATE users SET vk_token = ? WHERE telegram_id = ?",
+                        (enc, row["telegram_id"]),
+                    )
+
 
 # ─── Пользователи ─────────────────────────────────────────────────────────────
 
@@ -179,17 +195,21 @@ def get_vk_token(telegram_id: int) -> str | None:
         row = conn.execute(
             "SELECT vk_token FROM users WHERE telegram_id = ?", (telegram_id,)
         ).fetchone()
-    return row["vk_token"] if row else None
+    if not row:
+        return None
+    # Прозрачно расшифровываем; старые незашифрованные токены вернутся как есть.
+    return crypto.decrypt(row["vk_token"])
 
 
 def set_vk_token(telegram_id: int, token: str) -> None:
+    stored = crypto.encrypt(token)  # шифруем перед записью (если crypto доступен)
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO users (telegram_id, vk_token) VALUES (?, ?)
             ON CONFLICT(telegram_id) DO UPDATE SET vk_token = excluded.vk_token
             """,
-            (telegram_id, token),
+            (telegram_id, stored),
         )
 
 
