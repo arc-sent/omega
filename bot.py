@@ -639,6 +639,7 @@ def rule_detail_text(r) -> str:
         dur = f"{lo}..{hi} сек"
     order = "старые→новые" if r["order_dir"] == "old" else "новые→старые"
     acc = r["account_name"] if "account_name" in r.keys() and r["account_name"] else "—"
+    repost = "🔁 вкл" if r["allow_repost"] else "выкл"
     return (
         f"📋 Правило #{r['id']}\n"
         f"🎬 Источник: {r['source_name']}\n"
@@ -649,6 +650,7 @@ def rule_detail_text(r) -> str:
         f"🕒 Слоты (МСК): {r['slots']}\n"
         f"⏱ Длительность: {dur}\n"
         f"↕️ Порядок: {order}\n"
+        f"🔄 Перезаливка: {repost}\n"
         f"📝 Описание: {(r['description'] or '—')[:100]}\n"
         f"✅ Опубликовано: {db.count_published(r['id'])}"
     )
@@ -664,6 +666,10 @@ def rule_detail_kb(r) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⏱ Длительность", callback_data=f"rule_dur_{rid}"),
          InlineKeyboardButton("↕️ Порядок", callback_data=f"rule_order_{rid}")],
         [InlineKeyboardButton("📝 Описание", callback_data=f"rule_desc_{rid}")],
+        [InlineKeyboardButton(
+            "🔄 Перезаливка: выкл" if not r["allow_repost"] else "🔄 Перезаливка: вкл",
+            callback_data=f"rule_repost_{rid}",
+        )],
         [InlineKeyboardButton("▶️ Тест: опубликовать 1 сейчас", callback_data=f"rule_now_{rid}")],
         [InlineKeyboardButton("🗑 Удалить правило", callback_data=f"rule_del_{rid}")],
         [InlineKeyboardButton("⬅️ К списку", callback_data="rule_list")],
@@ -761,6 +767,15 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
         if not was_enabled:
             await _plan_and_notify(query, context, rid)
+        return
+
+    if data.startswith("rule_repost_"):
+        await query.answer()
+        rid = int(data.rsplit("_", 1)[1])
+        r = db.get_rule(rid)
+        db.update_rule(rid, allow_repost=0 if r["allow_repost"] else 1)
+        r = db.get_rule(rid)
+        await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
         return
 
     if data.startswith("rule_now_"):
@@ -1154,7 +1169,7 @@ def main() -> None:
     app.add_handler(rule_edit_conv)
     app.add_handler(CallbackQueryHandler(
         rules_button,
-        pattern=r"^(rule_list|rule_add|rule_src_|rule_grp_|rule_open_|rule_toggle_|rule_order_|rule_now_|rule_del_)",
+        pattern=r"^(rule_list|rule_add|rule_src_|rule_grp_|rule_open_|rule_toggle_|rule_order_|rule_repost_|rule_now_|rule_del_)",
     ))
 
     scheduler.register_jobs(app)

@@ -214,7 +214,30 @@ def plan_rule(job_queue, rule) -> int:
         return 0
 
     if not candidates:
-        return 0
+        if not rule["allow_repost"]:
+            return 0
+        # Источник исчерпан + включена перезаливка: сбрасываем историю и начинаем круг заново.
+        # scheduled_ids оставляем — не дублируем то, что уже стоит в очереди.
+        db.clear_published(rule_id)
+        logger.info("Правило %s (%s → %s): источник исчерпан, сброс для перезаливки",
+                    rule_id, rule["source_name"], rule["group_name"])
+        try:
+            candidates = fetch_candidates(
+                rule["db_path"],
+                username=rule["username"],
+                min_duration=rule["min_duration"],
+                max_duration=rule["max_duration"],
+                order_dir=rule["order_dir"],
+                exclude_ids=db.get_scheduled_ids(rule_id),
+                limit=remaining,
+            )
+        except SourceError as e:
+            logger.warning("Правило %s: источник недоступен (перезаливка): %s", rule_id, e)
+            _record_error(rule["telegram_id"], e, stage="чтение источника (перезаливка)",
+                          vk_group_id=rule["vk_group_id"], vk_group_name=rule["group_name"])
+            return 0
+        if not candidates:
+            return 0
 
     # По одному ролику на свободный слот (кандидатов не больше, чем свободных слотов).
     times = free_times[:len(candidates)]

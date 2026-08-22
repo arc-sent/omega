@@ -87,6 +87,7 @@ def init_db() -> None:
                 max_duration   INTEGER,
                 order_dir      TEXT NOT NULL DEFAULT 'old',
                 enabled        INTEGER NOT NULL DEFAULT 1,
+                allow_repost   INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)  ON DELETE CASCADE,
                 FOREIGN KEY (source_id)   REFERENCES sources(id)         ON DELETE CASCADE,
                 FOREIGN KEY (group_id)    REFERENCES vk_groups(id)       ON DELETE CASCADE,
@@ -141,6 +142,10 @@ def init_db() -> None:
         )
 
         # ── Миграции старых схем ──────────────────────────────────────────────
+
+        rule_cols = {row[1] for row in conn.execute("PRAGMA table_info(rules)")}
+        if "allow_repost" not in rule_cols:
+            conn.execute("ALTER TABLE rules ADD COLUMN allow_repost INTEGER NOT NULL DEFAULT 0")
 
         src_cols = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
         for col, defn in [
@@ -473,7 +478,7 @@ def add_rule(
 def update_rule(rule_id: int, **fields) -> None:
     allowed = {
         "videos_per_day", "slots", "description",
-        "min_duration", "max_duration", "order_dir", "enabled",
+        "min_duration", "max_duration", "order_dir", "enabled", "allow_repost",
     }
     sets, values = [], []
     for key, value in fields.items():
@@ -501,6 +506,12 @@ def get_published_ids(rule_id: int) -> set[str]:
             "SELECT tt_video_id FROM published WHERE rule_id = ?", (rule_id,)
         ).fetchall()
     return {r["tt_video_id"] for r in rows}
+
+
+def clear_published(rule_id: int) -> None:
+    """Сбросить историю публикаций правила (для режима перезаливки)."""
+    with _connect() as conn:
+        conn.execute("DELETE FROM published WHERE rule_id = ?", (rule_id,))
 
 
 def mark_published(rule_id: int, tt_video_id: str) -> None:
