@@ -2,11 +2,11 @@
 
 Модель данных (связь источник↔группа — многие-ко-многим через «правила»):
 
-    users            — телеграм-пользователь и его VK-токен
-    vk_groups        — целевые VK-группы пользователя
+    users            — телеграм-пользователь
+    vk_accounts      — VK-аккаунты (токены) пользователя; один пользователь — много аккаунтов
+    vk_groups        — целевые VK-группы; каждая привязана к одному аккаунту
     sources          — источники видео (путь к БД парсера + фильтр по нику)
     rules            — правило = пара (источник → группа) + настройки публикации
-                       (сколько видео/день, слоты, описание, фильтр длительности)
     published        — что уже опубликовано по каждому правилу (дедуп)
     scheduled_posts  — запланированные публикации (переживают рестарт бота)
     error_logs       — журнал ошибок для /errors и админ-панели
@@ -39,7 +39,15 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
-                vk_token    TEXT
+                vk_token    TEXT    -- устарело; хранится только для миграции
+            );
+
+            CREATE TABLE IF NOT EXISTS vk_accounts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                name        TEXT NOT NULL DEFAULT 'Основной',
+                vk_token    TEXT,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS vk_groups (
@@ -47,38 +55,37 @@ def init_db() -> None:
                 telegram_id INTEGER NOT NULL,
                 vk_group_id INTEGER NOT NULL,
                 name        TEXT NOT NULL,
+                account_id  INTEGER,
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
+                FOREIGN KEY (account_id) REFERENCES vk_accounts(id) ON DELETE SET NULL,
                 UNIQUE (telegram_id, vk_group_id)
             );
 
             CREATE TABLE IF NOT EXISTS sources (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER NOT NULL,
-                name        TEXT NOT NULL,       -- как показывать пользователю
-                db_path     TEXT NOT NULL,       -- путь к SQLite-базе с видео
-                username    TEXT,                -- фильтр по нику внутри базы (опц.)
-                kind        TEXT NOT NULL DEFAULT 'db',  -- 'db' | 'account'
-                account     TEXT,                -- ник/ссылка TikTok (для kind='account')
-                backfill_done INTEGER NOT NULL DEFAULT 0,  -- 1 = вся история аккаунта уже собрана
-                parse_start INTEGER NOT NULL DEFAULT 1,    -- с какого ролика парсить (1-based; kind='account')
+                name        TEXT NOT NULL,
+                db_path     TEXT NOT NULL,
+                username    TEXT,
+                kind        TEXT NOT NULL DEFAULT 'db',
+                account     TEXT,
+                backfill_done INTEGER NOT NULL DEFAULT 0,
+                parse_start INTEGER NOT NULL DEFAULT 1,
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
                 UNIQUE (telegram_id, name)
             );
 
-            -- Правило = связь «источник → группа» + настройки публикации.
-            -- Многие-ко-многим: у источника может быть несколько правил (в разные
-            -- группы), у группы — несколько правил (из разных источников).
             CREATE TABLE IF NOT EXISTS rules (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id    INTEGER NOT NULL,
                 source_id      INTEGER NOT NULL,
-                group_id       INTEGER NOT NULL,        -- ссылается на vk_groups.id
+                group_id       INTEGER NOT NULL,
                 videos_per_day INTEGER NOT NULL DEFAULT 3,
-                slots          TEXT NOT NULL DEFAULT '9,15,20',  -- часы МСК через запятую
-                description    TEXT,                    -- описание к записи (опц.)
-                min_duration   INTEGER,                 -- сек, нижняя граница (опц.)
-                max_duration   INTEGER,                 -- сек, верхняя граница (опц.)
-                order_dir      TEXT NOT NULL DEFAULT 'old',  -- 'old' | 'new'
+                slots          TEXT NOT NULL DEFAULT '9,15,20',
+                description    TEXT,
+                min_duration   INTEGER,
+                max_duration   INTEGER,
+                order_dir      TEXT NOT NULL DEFAULT 'old',
                 enabled        INTEGER NOT NULL DEFAULT 1,
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)  ON DELETE CASCADE,
                 FOREIGN KEY (source_id)   REFERENCES sources(id)         ON DELETE CASCADE,
@@ -86,9 +93,6 @@ def init_db() -> None:
                 UNIQUE (source_id, group_id)
             );
 
-            -- Дедуп: какое видео уже ушло по какому правилу. Одно видео может
-            -- уйти в РАЗНЫЕ группы (разные правила), но в одну группу из одного
-            -- источника — ровно один раз.
             CREATE TABLE IF NOT EXISTS published (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 rule_id      INTEGER NOT NULL,
@@ -100,9 +104,6 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_published_rule ON published (rule_id);
 
-            -- Запланированные публикации: строка живёт от планирования до момента
-            -- публикации. Нужна, чтобы расписание пережило рестарт (job_queue в
-            -- памяти). Видео скачивается по url в момент публикации, а не заранее.
             CREATE TABLE IF NOT EXISTS scheduled_posts (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id   INTEGER NOT NULL,
@@ -114,6 +115,7 @@ def init_db() -> None:
                 vk_group_id   INTEGER NOT NULL,
                 vk_group_name TEXT NOT NULL,
                 publish_at    INTEGER NOT NULL,
+                account_id    INTEGER,
                 FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE CASCADE
             );
 
@@ -137,24 +139,31 @@ def init_db() -> None:
                 ON error_logs (telegram_id, created_at DESC);
             """
         )
-        # Миграция старых баз, где в sources ещё не было kind/account.
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
-        if "kind" not in cols:
-            conn.execute("ALTER TABLE sources ADD COLUMN kind TEXT NOT NULL DEFAULT 'db'")
-        if "account" not in cols:
-            conn.execute("ALTER TABLE sources ADD COLUMN account TEXT")
-        if "backfill_done" not in cols:
+
+        # ── Миграции старых схем ──────────────────────────────────────────────
+
+        src_cols = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
+        for col, defn in [
+            ("kind",         "TEXT NOT NULL DEFAULT 'db'"),
+            ("account",      "TEXT"),
+            ("backfill_done","INTEGER NOT NULL DEFAULT 0"),
+            ("parse_start",  "INTEGER NOT NULL DEFAULT 1"),
+        ]:
+            if col not in src_cols:
+                conn.execute(f"ALTER TABLE sources ADD COLUMN {col} {defn}")
+
+        grp_cols = {row[1] for row in conn.execute("PRAGMA table_info(vk_groups)")}
+        if "account_id" not in grp_cols:
             conn.execute(
-                "ALTER TABLE sources ADD COLUMN backfill_done INTEGER NOT NULL DEFAULT 0"
-            )
-        if "parse_start" not in cols:
-            conn.execute(
-                "ALTER TABLE sources ADD COLUMN parse_start INTEGER NOT NULL DEFAULT 1"
+                "ALTER TABLE vk_groups ADD COLUMN account_id INTEGER "
+                "REFERENCES vk_accounts(id) ON DELETE SET NULL"
             )
 
-        # Одно видео не может стоять в очереди по одному правилу дважды. Сначала
-        # чистим уже накопленные дубли (оставляем самую раннюю строку), затем
-        # вешаем уникальный индекс — дальше INSERT OR IGNORE не даст задвоить.
+        sp_cols = {row[1] for row in conn.execute("PRAGMA table_info(scheduled_posts)")}
+        if "account_id" not in sp_cols:
+            conn.execute("ALTER TABLE scheduled_posts ADD COLUMN account_id INTEGER")
+
+        # Уникальный индекс на scheduled_posts
         conn.execute(
             """
             DELETE FROM scheduled_posts
@@ -168,19 +177,51 @@ def init_db() -> None:
             "ON scheduled_posts (rule_id, tt_video_id)"
         )
 
-        # Одноразовая миграция: зашифровать уже хранящиеся открытым текстом токены,
-        # чтобы в дампе БД их не было. Безопасно и идемпотентно: encrypt() не трогает
-        # уже зашифрованные значения (префикс enc:), а get_vk_token читает оба вида.
+        # ── Миграция users.vk_token → vk_accounts ────────────────────────────
         for row in conn.execute(
             "SELECT telegram_id, vk_token FROM users WHERE vk_token IS NOT NULL"
         ).fetchall():
+            token = row["vk_token"]
+            if not crypto.is_encrypted(token):
+                token = crypto.encrypt(token) or token
+            existing = conn.execute(
+                "SELECT id FROM vk_accounts WHERE telegram_id = ?", (row["telegram_id"],)
+            ).fetchone()
+            if not existing:
+                cur = conn.execute(
+                    "INSERT INTO vk_accounts (telegram_id, name, vk_token) VALUES (?, ?, ?)",
+                    (row["telegram_id"], "Основной", token),
+                )
+                aid = cur.lastrowid
+                conn.execute(
+                    "UPDATE vk_groups SET account_id = ? "
+                    "WHERE telegram_id = ? AND account_id IS NULL",
+                    (aid, row["telegram_id"]),
+                )
+
+        # Зашифровать незашифрованные токены в vk_accounts
+        for row in conn.execute(
+            "SELECT id, vk_token FROM vk_accounts WHERE vk_token IS NOT NULL"
+        ).fetchall():
             if not crypto.is_encrypted(row["vk_token"]):
                 enc = crypto.encrypt(row["vk_token"])
-                if enc != row["vk_token"]:  # crypto доступен и что-то зашифровалось
+                if enc != row["vk_token"]:
                     conn.execute(
-                        "UPDATE users SET vk_token = ? WHERE telegram_id = ?",
-                        (enc, row["telegram_id"]),
+                        "UPDATE vk_accounts SET vk_token = ? WHERE id = ?",
+                        (enc, row["id"]),
                     )
+
+        # Проставить account_id в scheduled_posts (миграция существующих строк)
+        conn.execute(
+            """
+            UPDATE scheduled_posts SET account_id = (
+                SELECT g.account_id FROM vk_groups g
+                WHERE g.vk_group_id = scheduled_posts.vk_group_id
+                  AND g.telegram_id = scheduled_posts.telegram_id
+                LIMIT 1
+            ) WHERE account_id IS NULL
+            """
+        )
 
 
 # ─── Пользователи ─────────────────────────────────────────────────────────────
@@ -190,32 +231,67 @@ def ensure_user(telegram_id: int) -> None:
         conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (telegram_id,))
 
 
-def get_vk_token(telegram_id: int) -> str | None:
+# ─── VK-аккаунты ──────────────────────────────────────────────────────────────
+
+def get_accounts(telegram_id: int) -> list[sqlite3.Row]:
     with _connect() as conn:
-        row = conn.execute(
-            "SELECT vk_token FROM users WHERE telegram_id = ?", (telegram_id,)
+        return conn.execute(
+            "SELECT * FROM vk_accounts WHERE telegram_id = ? ORDER BY id",
+            (telegram_id,),
+        ).fetchall()
+
+
+def get_account(account_id: int) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM vk_accounts WHERE id = ?", (account_id,)
         ).fetchone()
-    if not row:
-        return None
-    # Прозрачно расшифровываем; старые незашифрованные токены вернутся как есть.
-    return crypto.decrypt(row["vk_token"])
 
 
-def set_vk_token(telegram_id: int, token: str) -> None:
-    stored = crypto.encrypt(token)  # шифруем перед записью (если crypto доступен)
+def add_account(telegram_id: int, name: str, token: str) -> int:
+    stored = crypto.encrypt(token)
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO vk_accounts (telegram_id, name, vk_token) VALUES (?, ?, ?)",
+            (telegram_id, name, stored),
+        )
+        return cur.lastrowid
+
+
+def update_account_name(account_id: int, name: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE vk_accounts SET name = ? WHERE id = ?", (name, account_id))
+
+
+def update_account_token(account_id: int, token: str) -> None:
+    stored = crypto.encrypt(token)
     with _connect() as conn:
         conn.execute(
-            """
-            INSERT INTO users (telegram_id, vk_token) VALUES (?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET vk_token = excluded.vk_token
-            """,
-            (telegram_id, stored),
+            "UPDATE vk_accounts SET vk_token = ? WHERE id = ?", (stored, account_id)
         )
 
 
-def clear_vk_token(telegram_id: int) -> None:
+def delete_account(account_id: int) -> None:
     with _connect() as conn:
-        conn.execute("UPDATE users SET vk_token = NULL WHERE telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM vk_accounts WHERE id = ?", (account_id,))
+
+
+def get_vk_token_by_account(account_id: int) -> str | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT vk_token FROM vk_accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return crypto.decrypt(row["vk_token"])
+
+
+def count_groups_for_account(account_id: int) -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM vk_groups WHERE account_id = ?", (account_id,)
+        ).fetchone()
+    return row["c"] if row else 0
 
 
 # ─── Группы VK ────────────────────────────────────────────────────────────────
@@ -223,23 +299,34 @@ def clear_vk_token(telegram_id: int) -> None:
 def get_groups(telegram_id: int) -> list[sqlite3.Row]:
     with _connect() as conn:
         return conn.execute(
-            "SELECT * FROM vk_groups WHERE telegram_id = ? ORDER BY id", (telegram_id,)
+            """
+            SELECT g.*, a.name AS account_name
+            FROM vk_groups g
+            LEFT JOIN vk_accounts a ON a.id = g.account_id
+            WHERE g.telegram_id = ?
+            ORDER BY g.id
+            """,
+            (telegram_id,),
         ).fetchall()
 
 
 def get_group(group_row_id: int) -> sqlite3.Row | None:
     with _connect() as conn:
-        return conn.execute("SELECT * FROM vk_groups WHERE id = ?", (group_row_id,)).fetchone()
+        return conn.execute(
+            "SELECT * FROM vk_groups WHERE id = ?", (group_row_id,)
+        ).fetchone()
 
 
-def add_group(telegram_id: int, vk_group_id: int, name: str) -> None:
+def add_group(telegram_id: int, vk_group_id: int, name: str, account_id: int) -> None:
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO vk_groups (telegram_id, vk_group_id, name) VALUES (?, ?, ?)
-            ON CONFLICT(telegram_id, vk_group_id) DO UPDATE SET name = excluded.name
+            INSERT INTO vk_groups (telegram_id, vk_group_id, name, account_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id, vk_group_id)
+            DO UPDATE SET name = excluded.name, account_id = excluded.account_id
             """,
-            (telegram_id, vk_group_id, name),
+            (telegram_id, vk_group_id, name, account_id),
         )
 
 
@@ -281,13 +368,11 @@ def add_source(
 
 
 def set_source_db_path(source_id: int, db_path: str) -> None:
-    """Проставить путь к базе (для источника-аккаунта — после получения id)."""
     with _connect() as conn:
         conn.execute("UPDATE sources SET db_path = ? WHERE id = ?", (db_path, source_id))
 
 
 def set_source_parse_start(source_id: int, parse_start: int) -> None:
-    """С какого ролика (1-based) парсить источник-аккаунт при обновлении."""
     with _connect() as conn:
         conn.execute(
             "UPDATE sources SET parse_start = ? WHERE id = ?",
@@ -296,13 +381,11 @@ def set_source_parse_start(source_id: int, parse_start: int) -> None:
 
 
 def get_account_sources() -> list[sqlite3.Row]:
-    """Все источники-аккаунты всех пользователей (для планового до-парсинга)."""
     with _connect() as conn:
         return conn.execute("SELECT * FROM sources WHERE kind = 'account'").fetchall()
 
 
 def set_backfill_done(source_id: int, done: bool = True) -> None:
-    """Отметить, что вся история аккаунта собрана (или сбросить флаг)."""
     with _connect() as conn:
         conn.execute(
             "UPDATE sources SET backfill_done = ? WHERE id = ?",
@@ -315,18 +398,19 @@ def delete_source(source_id: int) -> None:
         conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
 
 
-# ─── Правила (источник → группа + настройки) ──────────────────────────────────
+# ─── Правила ──────────────────────────────────────────────────────────────────
 
 def get_rules(telegram_id: int) -> list[sqlite3.Row]:
-    """Правила пользователя с именами источника и группы (для списков в UI)."""
     with _connect() as conn:
         return conn.execute(
             """
             SELECT r.*, s.name AS source_name,
-                   g.name AS group_name, g.vk_group_id AS vk_group_id
+                   g.name AS group_name, g.vk_group_id AS vk_group_id,
+                   g.account_id AS account_id, a.name AS account_name
             FROM rules r
-            JOIN sources   s ON s.id = r.source_id
-            JOIN vk_groups g ON g.id = r.group_id
+            JOIN sources      s ON s.id = r.source_id
+            JOIN vk_groups    g ON g.id = r.group_id
+            LEFT JOIN vk_accounts a ON a.id = g.account_id
             WHERE r.telegram_id = ?
             ORDER BY r.id
             """,
@@ -335,12 +419,12 @@ def get_rules(telegram_id: int) -> list[sqlite3.Row]:
 
 
 def get_enabled_rules() -> list[sqlite3.Row]:
-    """Все включённые правила всех пользователей (для планировщика)."""
     with _connect() as conn:
         return conn.execute(
             """
             SELECT r.*, s.name AS source_name, s.db_path AS db_path, s.username AS username,
-                   g.name AS group_name, g.vk_group_id AS vk_group_id
+                   g.name AS group_name, g.vk_group_id AS vk_group_id,
+                   g.account_id AS account_id
             FROM rules r
             JOIN sources   s ON s.id = r.source_id
             JOIN vk_groups g ON g.id = r.group_id
@@ -355,7 +439,8 @@ def get_rule(rule_id: int) -> sqlite3.Row | None:
         return conn.execute(
             """
             SELECT r.*, s.name AS source_name, s.db_path AS db_path, s.username AS username,
-                   g.name AS group_name, g.vk_group_id AS vk_group_id
+                   g.name AS group_name, g.vk_group_id AS vk_group_id,
+                   g.account_id AS account_id
             FROM rules r
             JOIN sources   s ON s.id = r.source_id
             JOIN vk_groups g ON g.id = r.group_id
@@ -366,16 +451,10 @@ def get_rule(rule_id: int) -> sqlite3.Row | None:
 
 
 def add_rule(
-    telegram_id: int,
-    source_id: int,
-    group_id: int,
-    *,
-    videos_per_day: int = 3,
-    slots: str = "9,15,20",
-    description: str | None = None,
-    min_duration: int | None = None,
-    max_duration: int | None = None,
-    order_dir: str = "old",
+    telegram_id: int, source_id: int, group_id: int,
+    *, videos_per_day: int = 3, slots: str = "9,15,20",
+    description: str | None = None, min_duration: int | None = None,
+    max_duration: int | None = None, order_dir: str = "old",
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
@@ -392,7 +471,6 @@ def add_rule(
 
 
 def update_rule(rule_id: int, **fields) -> None:
-    """Обновляет заданные поля правила. Разрешён только белый список колонок."""
     allowed = {
         "videos_per_day", "slots", "description",
         "min_duration", "max_duration", "order_dir", "enabled",
@@ -428,10 +506,7 @@ def get_published_ids(rule_id: int) -> set[str]:
 def mark_published(rule_id: int, tt_video_id: str) -> None:
     with _connect() as conn:
         conn.execute(
-            """
-            INSERT OR IGNORE INTO published (rule_id, tt_video_id, published_at)
-            VALUES (?, ?, ?)
-            """,
+            "INSERT OR IGNORE INTO published (rule_id, tt_video_id, published_at) VALUES (?, ?, ?)",
             (rule_id, tt_video_id, int(time.time())),
         )
 
@@ -445,7 +520,6 @@ def count_published(rule_id: int) -> int:
 
 
 def count_published_between(rule_id: int, start_ts: int, end_ts: int) -> int:
-    """Сколько опубликовано по правилу за интервал (для дневной квоты)."""
     with _connect() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS c FROM published "
@@ -458,7 +532,6 @@ def count_published_between(rule_id: int, start_ts: int, end_ts: int) -> int:
 # ─── Запланированные публикации ───────────────────────────────────────────────
 
 def get_scheduled_ids(rule_id: int) -> set[str]:
-    """Видео правила, уже стоящие в очереди (чтобы планировщик не выбрал их дважды)."""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT tt_video_id FROM scheduled_posts WHERE rule_id = ?", (rule_id,)
@@ -467,10 +540,6 @@ def get_scheduled_ids(rule_id: int) -> set[str]:
 
 
 def get_scheduled_publish_times(rule_id: int) -> list[int]:
-    """Моменты (publish_at) всех публикаций правила, уже стоящих в очереди.
-
-    Нужно планировщику, чтобы не ставить второй ролик на уже занятый слот
-    (защита от «пачки» при повторных прогонах/рестартах в пределах дня)."""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT publish_at FROM scheduled_posts WHERE rule_id = ?", (rule_id,)
@@ -479,7 +548,6 @@ def get_scheduled_publish_times(rule_id: int) -> list[int]:
 
 
 def count_scheduled_between(rule_id: int, start_ts: int, end_ts: int) -> int:
-    """Сколько публикаций правила уже стоит в очереди на интервал (для дневной квоты)."""
     with _connect() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS c FROM scheduled_posts "
@@ -490,43 +558,28 @@ def count_scheduled_between(rule_id: int, start_ts: int, end_ts: int) -> int:
 
 
 def add_scheduled_post(
-    *,
-    telegram_id: int,
-    rule_id: int,
-    tt_video_id: str,
-    url: str,
-    title: str | None,
-    description: str | None,
-    vk_group_id: int,
-    vk_group_name: str,
-    publish_at: int,
+    *, telegram_id: int, rule_id: int, tt_video_id: str, url: str,
+    title: str | None, description: str | None,
+    vk_group_id: int, vk_group_name: str, publish_at: int,
+    account_id: int | None = None,
 ) -> int | None:
-    """Поставить публикацию в очередь. Вернуть id новой строки, либо None, если
-    это видео уже стоит в очереди по данному правилу (дубль не создаётся)."""
     with _connect() as conn:
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO scheduled_posts
                 (telegram_id, rule_id, tt_video_id, url, title, description,
-                 vk_group_id, vk_group_name, publish_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 vk_group_id, vk_group_name, publish_at, account_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (telegram_id, rule_id, tt_video_id, url, title, description,
-             vk_group_id, vk_group_name, publish_at),
+             vk_group_id, vk_group_name, publish_at, account_id),
         )
         if cur.rowcount == 0:
-            return None  # уникальный индекс (rule_id, tt_video_id) отсёк дубль
+            return None
         return cur.lastrowid
 
 
 def update_scheduled_posts_description(rule_id: int, description: str | None) -> int:
-    """Обновить описание у ещё не опубликованных постов правила в очереди.
-
-    Описание замораживается в scheduled_posts в момент планирования. Если
-    пользователь меняет описание правила уже ПОСЛЕ того, как сегодняшняя квота
-    разложена (типичный сценарий: создал правило → оно сразу спланировалось с
-    пустым описанием → потом задал текст), эти строки надо обновить, иначе они
-    уйдут в VK со старым/пустым описанием. Возвращает число обновлённых строк."""
     with _connect() as conn:
         cur = conn.execute(
             "UPDATE scheduled_posts SET description = ? WHERE rule_id = ?",
@@ -547,8 +600,6 @@ def delete_scheduled_post(post_id: int) -> None:
 
 # ─── Логи ошибок ──────────────────────────────────────────────────────────────
 
-# Маскировка VK-токенов перед записью: текст ошибки/traceback может содержать
-# access_token= в URL или сам токен vk1.a.* — их нельзя хранить в логах.
 _TOKEN_PATTERNS = [
     (re.compile(r"access_token=[^&\s\"'}]+"), "access_token=***"),
     (re.compile(r"vk1\.a\.[A-Za-z0-9._\-]+"), "vk1.a.***"),
@@ -564,18 +615,11 @@ def _sanitize(text: str | None) -> str | None:
 
 
 def log_error(
-    telegram_id: int,
-    *,
-    stage: str | None = None,
-    platform: str | None = None,
-    url: str | None = None,
-    vk_group_id: int | None = None,
-    vk_group_name: str | None = None,
-    error_code: int | None = None,
-    message: str | None = None,
-    traceback: str | None = None,
+    telegram_id: int, *, stage: str | None = None, platform: str | None = None,
+    url: str | None = None, vk_group_id: int | None = None,
+    vk_group_name: str | None = None, error_code: int | None = None,
+    message: str | None = None, traceback: str | None = None,
 ) -> None:
-    """Best-effort: при сбое БД не роняет обработку."""
     try:
         with _connect() as conn:
             conn.execute(
@@ -598,10 +642,8 @@ def log_error(
 def get_errors(telegram_id: int, limit: int = 8, offset: int = 0) -> list[sqlite3.Row]:
     with _connect() as conn:
         return conn.execute(
-            """
-            SELECT * FROM error_logs WHERE telegram_id = ?
-            ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
-            """,
+            "SELECT * FROM error_logs WHERE telegram_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             (telegram_id, limit, offset),
         ).fetchall()
 

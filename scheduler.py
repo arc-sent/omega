@@ -39,16 +39,16 @@ DEEPEN_MAX_PASSES = int(os.getenv("DEEPEN_MAX_PASSES", "3"))
 
 PLATFORM_LABELS = {"tiktok": "TikTok", "likee": "Likee", "youtube": "YouTube Shorts", "vk": "VK"}
 
-# Семафор публикации на пользователя: лимиты VK считаются по токену, поэтому
-# запросы одного юзера не идут лавиной, а разные юзеры друг друга не ждут.
-_vk_publish_semaphores: dict[int, asyncio.Semaphore] = {}
+# Семафор публикации на аккаунт: лимиты VK считаются по токену, поэтому
+# запросы одного аккаунта не идут лавиной, а разные аккаунты не блокируют друг друга.
+_vk_account_semaphores: dict[int, asyncio.Semaphore] = {}
 
 
-def _user_semaphore(telegram_id: int) -> asyncio.Semaphore:
-    sem = _vk_publish_semaphores.get(telegram_id)
+def _account_semaphore(account_id: int) -> asyncio.Semaphore:
+    sem = _vk_account_semaphores.get(account_id)
     if sem is None:
         sem = asyncio.Semaphore(VK_PUBLISH_CONCURRENCY)
-        _vk_publish_semaphores[telegram_id] = sem
+        _vk_account_semaphores[account_id] = sem
     return sem
 
 
@@ -69,9 +69,9 @@ async def _download(url: str, vk_token: str | None) -> tuple[str, str]:
 
 # ─── Публикация с семафором и ретраями ────────────────────────────────────────
 
-async def _publish_to_vk(telegram_id, vk_token, vk_group_id, file_path, title, description) -> None:
+async def _publish_to_vk(account_id, vk_token, vk_group_id, file_path, title, description) -> None:
     loop = asyncio.get_running_loop()
-    semaphore = _user_semaphore(telegram_id)
+    semaphore = _account_semaphore(account_id)
     for attempt in range(1, VK_PUBLISH_RETRIES + 1):
         async with semaphore:
             try:
@@ -233,6 +233,7 @@ def plan_rule(job_queue, rule) -> int:
             vk_group_id=rule["vk_group_id"],
             vk_group_name=rule["group_name"],
             publish_at=publish_at,
+            account_id=rule["account_id"],
         )
         if post_id is None:
             continue  # видео уже в очереди (гонка/второй экземпляр) — не задваиваем
@@ -253,8 +254,8 @@ def schedule_test_now(job_queue, rule_id: int) -> tuple[bool, str]:
     rule = db.get_rule(rule_id)
     if not rule:
         return False, "Правило не найдено."
-    if not db.get_vk_token(rule["telegram_id"]):
-        return False, "Сначала задай VK токен."
+    if not rule["account_id"] or not db.get_vk_token_by_account(rule["account_id"]):
+        return False, "Сначала задай VK токен для аккаунта этой группы."
 
     exclude = db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id)
     try:
@@ -275,6 +276,7 @@ def schedule_test_now(job_queue, rule_id: int) -> tuple[bool, str]:
         tt_video_id=v["tt_video_id"], url=v["url"], title=v["title"],
         description=rule["description"], vk_group_id=rule["vk_group_id"],
         vk_group_name=rule["group_name"], publish_at=publish_at,
+        account_id=rule["account_id"],
     )
     if post_id is None:
         return False, "Это видео уже стоит в очереди на публикацию."
@@ -402,9 +404,14 @@ async def daily_plan_job(context) -> None:
     await ensure_backlog(context)
 
     rules = db.get_enabled_rules()
+    loop = asyncio.get_running_loop()
     total = 0
     for rule in rules:
-        total += plan_rule(context.job_queue, rule)
+        try:
+            n = await loop.run_in_executor(None, plan_rule, context.job_queue, rule)
+            total += n
+        except Exception:
+            logger.exception("Необработанная ошибка при планировании правила %s", rule["id"])
     if total:
         logger.info("Ежедневный план: поставлено публикаций: %s (правил: %s)", total, len(rules))
 
@@ -422,6 +429,7 @@ async def _publish_job(context) -> None:
     telegram_id = post["telegram_id"]
     rule_id = post["rule_id"]
     url = post["url"]
+    account_id = post["account_id"]
 
     # Страховка от повторной публикации: если по этому правилу видео уже отмечено
     # опубликованным (задвоенный job, гонка, повторный запуск) — ничего не постим,
@@ -437,14 +445,16 @@ async def _publish_job(context) -> None:
     file_path = None
 
     try:
-        vk_token = db.get_vk_token(telegram_id)
+        if not account_id:
+            raise VKError(None, "Аккаунт VK не привязан к группе", stage="проверка аккаунта")
+        vk_token = db.get_vk_token_by_account(account_id)
         if not vk_token:
-            raise VKError(None, "VK токен не задан — публиковать нечем", stage="проверка токена")
+            raise VKError(None, "VK токен не задан для этого аккаунта", stage="проверка токена")
 
         file_path, title = await _download(url, vk_token)
         title = post["title"] or title
         sent_description = post["description"] or ""
-        await _publish_to_vk(telegram_id, vk_token, vk_group_id, file_path,
+        await _publish_to_vk(account_id, vk_token, vk_group_id, file_path,
                              title, sent_description)
 
         db.mark_published(rule_id, post["tt_video_id"])
@@ -508,9 +518,14 @@ async def restore_and_schedule(app) -> None:
         logger.exception("Ошибка стартового до-парсинга аккаунтов")
 
     # Догоняем сегодняшний план (plan_rule сам исключит уже стоящие в очереди).
+    loop = asyncio.get_running_loop()
     total = 0
     for rule in db.get_enabled_rules():
-        total += plan_rule(app.job_queue, rule)
+        try:
+            n = await loop.run_in_executor(None, plan_rule, app.job_queue, rule)
+            total += n
+        except Exception:
+            logger.exception("Необработанная ошибка при планировании правила %s", rule["id"])
     if total:
         logger.info("Стартовый план: поставлено публикаций: %s", total)
 

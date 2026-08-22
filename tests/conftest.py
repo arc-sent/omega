@@ -1,41 +1,55 @@
 """Общая настройка тестов.
 
 Тесты не ходят в сеть и не трогают реальную БД: DATA_DIR перенаправляется во
-временную папку ДО первого импорта db (иначе db.DB_PATH зафиксируется на боевом
-пути). Перед каждым тестом база пересоздаётся с нуля.
+временную папку ДО первого импорта db. Перед каждым тестом база пересоздаётся.
 """
 
 import os
 import tempfile
 import pathlib
 
-# Должно выполниться раньше, чем любой тест сделает `import db`.
 _TEST_DATA_DIR = tempfile.mkdtemp(prefix="autopost_tests_")
 os.environ["DATA_DIR"] = _TEST_DATA_DIR
 
 import pytest
 
-import db  # noqa: E402  (импорт после установки DATA_DIR — намеренно)
+import db  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def fresh_db():
-    """Чистая база перед каждым тестом."""
+    """Чистая база перед каждым тестом.
+
+    На Windows SQLite WAL-файлы могут оставаться заблокированными после теста.
+    gc.collect() закрывает незакрытые соединения перед удалением файлов.
+    """
+    import gc
+    gc.collect()
     for f in pathlib.Path(_TEST_DATA_DIR).glob("autopost.db*"):
-        f.unlink()
+        try:
+            f.unlink()
+        except PermissionError:
+            pass  # файл ещё заблокирован; init_db перезапишет схему поверх
     db.init_db()
     yield
+    gc.collect()  # закрыть соединения теста до следующей итерации
 
 
 @pytest.fixture
 def user_group_source():
-    """Создать пользователя, группу и источник-заглушку. Вернуть их идентификаторы."""
+    """Создать пользователя, аккаунт, группу и источник-заглушку."""
     telegram_id = 1001
     db.ensure_user(telegram_id)
-    db.add_group(telegram_id, vk_group_id=555, name="Тестовая группа")
+    account_id = db.add_account(telegram_id, "Основной", "vk1.a.fake_token_for_tests_x" + "a" * 30)
+    db.add_group(telegram_id, vk_group_id=555, name="Тестовая группа", account_id=account_id)
     group_id = db.get_groups(telegram_id)[0]["id"]
     source_id = db.add_source(telegram_id, "Источник", "/nonexistent.db", None)
-    return {"telegram_id": telegram_id, "group_id": group_id, "source_id": source_id}
+    return {
+        "telegram_id": telegram_id,
+        "account_id": account_id,
+        "group_id": group_id,
+        "source_id": source_id,
+    }
 
 
 def make_source_db(path, videos):

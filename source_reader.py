@@ -62,6 +62,8 @@ def fetch_candidates(
     Видео без известной длительности фильтр по секундам НЕ отбрасывает.
     """
     exclude_ids = exclude_ids or set()
+    if limit is not None and limit <= 0:
+        return []
     order_sql = "ASC" if order_dir == "old" else "DESC"
 
     where = ["1=1"]
@@ -81,10 +83,17 @@ def fetch_candidates(
         f"FROM videos WHERE {' AND '.join(where)} "
         f"ORDER BY found_at {order_sql}, tt_video_id {order_sql}"
     )
+    # Ограничиваем SQL-выборку: нужно limit кандидатов после Python-фильтрации
+    # exclude_ids. Берём limit + len(exclude_ids) + 100 строк — с запасом на
+    # уже опубликованные, которые идут первыми в порядке сортировки.
+    if limit is not None:
+        sql += f" LIMIT {min(limit + len(exclude_ids) + 100, 10_000)}"
 
     conn = _connect_ro(db_path)
     try:
         rows = conn.execute(sql, params).fetchall()
+    except sqlite3.Error as e:
+        raise SourceError(f"Ошибка при чтении базы источника: {e}") from e
     finally:
         conn.close()
 

@@ -37,6 +37,7 @@ def _add_post(uge, rid, video_id, *, description, publish_at):
         telegram_id=uge["telegram_id"], rule_id=rid, tt_video_id=video_id,
         url=f"https://x/{video_id}", title="t", description=description,
         vk_group_id=555, vk_group_name="g", publish_at=publish_at,
+        account_id=uge.get("account_id"),
     )
 
 
@@ -69,7 +70,8 @@ def test_update_scheduled_posts_description_is_the_fix(user_group_source):
 def test_update_scheduled_posts_description_only_target_rule(user_group_source):
     rid1 = _add_rule(user_group_source)
     # второе правило (другая группа), чтобы проверить изоляцию
-    db.add_group(user_group_source["telegram_id"], vk_group_id=777, name="Группа 2")
+    db.add_group(user_group_source["telegram_id"], vk_group_id=777, name="Группа 2",
+                 account_id=user_group_source["account_id"])
     gid2 = [g for g in db.get_groups(user_group_source["telegram_id"]) if g["vk_group_id"] == 777][0]["id"]
     rid2 = db.add_rule(user_group_source["telegram_id"], user_group_source["source_id"], gid2)
 
