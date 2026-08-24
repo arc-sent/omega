@@ -263,6 +263,20 @@ def init_db() -> None:
             """
         )
 
+        # Присвоить источники без аккаунта первому аккаунту пользователя
+        for row in conn.execute(
+            "SELECT DISTINCT telegram_id FROM sources WHERE account_id IS NULL"
+        ).fetchall():
+            first_acc = conn.execute(
+                "SELECT id FROM vk_accounts WHERE telegram_id = ? ORDER BY id LIMIT 1",
+                (row["telegram_id"],),
+            ).fetchone()
+            if first_acc:
+                conn.execute(
+                    "UPDATE sources SET account_id = ? WHERE telegram_id = ? AND account_id IS NULL",
+                    (first_acc["id"], row["telegram_id"]),
+                )
+
 
 # ─── Пользователи ─────────────────────────────────────────────────────────────
 
