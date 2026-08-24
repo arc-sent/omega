@@ -397,8 +397,7 @@ def get_sources(telegram_id: int, *, for_account_id: int | None = None) -> list[
     with _connect() as conn:
         if for_account_id is not None:
             return conn.execute(
-                "SELECT * FROM sources WHERE telegram_id = ? "
-                "AND (account_id = ? OR account_id IS NULL) ORDER BY id",
+                "SELECT * FROM sources WHERE telegram_id = ? AND account_id = ? ORDER BY id",
                 (telegram_id, for_account_id),
             ).fetchall()
         return conn.execute(
