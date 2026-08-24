@@ -336,8 +336,19 @@ def count_groups_for_account(account_id: int) -> int:
 
 # ─── Группы VK ────────────────────────────────────────────────────────────────
 
-def get_groups(telegram_id: int) -> list[sqlite3.Row]:
+def get_groups(telegram_id: int, *, account_id: int | None = None) -> list[sqlite3.Row]:
     with _connect() as conn:
+        if account_id is not None:
+            return conn.execute(
+                """
+                SELECT g.*, a.name AS account_name
+                FROM vk_groups g
+                LEFT JOIN vk_accounts a ON a.id = g.account_id
+                WHERE g.telegram_id = ? AND g.account_id = ?
+                ORDER BY g.id
+                """,
+                (telegram_id, account_id),
+            ).fetchall()
         return conn.execute(
             """
             SELECT g.*, a.name AS account_name
@@ -447,8 +458,23 @@ def delete_source(source_id: int) -> None:
 
 # ─── Правила ──────────────────────────────────────────────────────────────────
 
-def get_rules(telegram_id: int) -> list[sqlite3.Row]:
+def get_rules(telegram_id: int, *, account_id: int | None = None) -> list[sqlite3.Row]:
     with _connect() as conn:
+        if account_id is not None:
+            return conn.execute(
+                """
+                SELECT r.*, s.name AS source_name,
+                       g.name AS group_name, g.vk_group_id AS vk_group_id,
+                       g.account_id AS account_id, a.name AS account_name
+                FROM rules r
+                JOIN sources      s ON s.id = r.source_id
+                JOIN vk_groups    g ON g.id = r.group_id
+                LEFT JOIN vk_accounts a ON a.id = g.account_id
+                WHERE r.telegram_id = ? AND g.account_id = ?
+                ORDER BY r.id
+                """,
+                (telegram_id, account_id),
+            ).fetchall()
         return conn.execute(
             """
             SELECT r.*, s.name AS source_name,

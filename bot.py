@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # ─── Состояния разговоров ─────────────────────────────────────────────────────
 ACC_NAME, ACC_TOKEN, ACC_RENAME, ACC_CHANGE_TOKEN = range(10, 14)
 G_ADD_ID, G_ADD_CONFIRM, G_ADD_NAME, G_RENAME, G_ADD_ACCOUNT = range(20, 25)
-SRC_NAME, SRC_TYPE, SRC_ACCOUNT, SRC_PATH, SRC_USER, SRC_START, SRC_ACCOUNT_PICK = range(30, 37)
+SRC_NAME, SRC_TYPE, SRC_ACCOUNT, SRC_PATH, SRC_USER, SRC_START = range(30, 36)
 RULE_EDIT_VALUE = 40
 
 # ─── Постоянное меню ──────────────────────────────────────────────────────────
@@ -69,6 +69,20 @@ def _mask_token(token: str) -> str:
     return f"{token[:6]}…{token[-4:]}"
 
 
+def _get_current_account(telegram_id: int, user_data: dict):
+    """Вернуть текущий аккаунт из user_data; при необходимости установить первый доступный."""
+    accounts = db.get_accounts(telegram_id)
+    if not accounts:
+        return None
+    aid = user_data.get("current_account_id")
+    if aid:
+        for a in accounts:
+            if a["id"] == aid:
+                return a
+    user_data["current_account_id"] = accounts[0]["id"]
+    return accounts[0]
+
+
 # ─── /start ───────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -91,38 +105,47 @@ async def main_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     text = update.message.text
     telegram_id = update.effective_user.id
     db.ensure_user(telegram_id)
+    cur = _get_current_account(telegram_id, context.user_data)
+    cur_acc_id = cur["id"] if cur else None
     if text == BTN_ACCOUNTS:
         await show_accounts(update, context)
     elif text == BTN_GROUPS:
-        await update.message.reply_text("Твои группы VK:", reply_markup=groups_kb(telegram_id))
+        await update.message.reply_text("Твои группы VK:", reply_markup=groups_kb(telegram_id, cur_acc_id))
     elif text == BTN_SOURCES:
-        await update.message.reply_text("Твои источники:", reply_markup=sources_kb(telegram_id))
+        await update.message.reply_text("Твои источники:", reply_markup=sources_kb(telegram_id, cur_acc_id))
     elif text == BTN_RULES:
-        await update.message.reply_text("Твои правила публикации:", reply_markup=rules_kb(telegram_id))
+        await update.message.reply_text("Твои правила публикации:", reply_markup=rules_kb(telegram_id, cur_acc_id))
     elif text == BTN_STATUS:
         await cmd_status(update, context)
 
 
 # ─── Аккаунты VK (токены) ─────────────────────────────────────────────────────
 
-def accounts_kb(telegram_id: int) -> InlineKeyboardMarkup:
+def accounts_kb(telegram_id: int, current_account_id: int | None = None) -> InlineKeyboardMarkup:
     rows = []
     for a in db.get_accounts(telegram_id):
+        is_active = a["id"] == current_account_id
+        marker = "✅ " if is_active else ""
         token_hint = f" · {_mask_token(db.get_vk_token_by_account(a['id']) or '')}" if a["vk_token"] else " · (нет токена)"
-        rows.append([InlineKeyboardButton(f"👤 {a['name']}{token_hint}", callback_data="noop")])
-        rows.append([
+        rows.append([InlineKeyboardButton(f"{marker}👤 {a['name']}{token_hint}", callback_data="noop")])
+        btn_row = []
+        if not is_active:
+            btn_row.append(InlineKeyboardButton("→ Перейти", callback_data=f"acc_switch_{a['id']}"))
+        btn_row += [
             InlineKeyboardButton("✏️", callback_data=f"acc_rename_{a['id']}"),
             InlineKeyboardButton("🔑 Токен", callback_data=f"acc_token_{a['id']}"),
             InlineKeyboardButton("🗑", callback_data=f"acc_del_{a['id']}"),
-        ])
+        ]
+        rows.append(btn_row)
     rows.append([InlineKeyboardButton("➕ Добавить аккаунт", callback_data="acc_add")])
     return InlineKeyboardMarkup(rows)
 
 
 async def show_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
+    cur = _get_current_account(telegram_id, context.user_data)
     await update.message.reply_text(
-        "Твои VK-аккаунты:", reply_markup=accounts_kb(telegram_id)
+        "Твои VK-аккаунты:", reply_markup=accounts_kb(telegram_id, cur["id"] if cur else None)
     )
 
 
@@ -170,6 +193,13 @@ async def acc_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.edit_message_text(VK_TOKEN_PROMPT)
         return ACC_CHANGE_TOKEN
 
+    if data.startswith("acc_switch_"):
+        aid = int(data.rsplit("_", 1)[1])
+        context.user_data["current_account_id"] = aid
+        await query.answer("✅ Аккаунт переключён")
+        await query.edit_message_text("Твои VK-аккаунты:", reply_markup=accounts_kb(telegram_id, aid))
+        return ConversationHandler.END
+
     if data.startswith("acc_del_"):
         aid = int(data.rsplit("_", 1)[1])
         cnt = db.count_groups_for_account(aid)
@@ -180,8 +210,15 @@ async def acc_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
             return ConversationHandler.END
         await query.answer("Удалено")
+        # Если удалили текущий — сбрасываем, _get_current_account выберет первый доступный
+        if context.user_data.get("current_account_id") == aid:
+            context.user_data.pop("current_account_id", None)
         db.delete_account(aid)
-        await query.edit_message_text("Твои VK-аккаунты:", reply_markup=accounts_kb(telegram_id))
+        cur = _get_current_account(telegram_id, context.user_data)
+        await query.edit_message_text(
+            "Твои VK-аккаунты:",
+            reply_markup=accounts_kb(telegram_id, cur["id"] if cur else None),
+        )
         return ConversationHandler.END
 
     await query.answer()
@@ -224,9 +261,10 @@ async def acc_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     aid = context.user_data.pop("acc_edit_id", None)
     if aid:
         db.update_account_name(aid, name)
+    tid = update.effective_user.id
     await update.message.reply_text(
         "✅ Переименовано.\n\nТвои VK-аккаунты:",
-        reply_markup=accounts_kb(update.effective_user.id),
+        reply_markup=accounts_kb(tid, context.user_data.get("current_account_id")),
     )
     return ConversationHandler.END
 
@@ -242,9 +280,10 @@ async def acc_change_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     aid = context.user_data.pop("acc_edit_id", None)
     if aid:
         db.update_account_token(aid, token)
+    tid = update.effective_user.id
     await update.message.reply_text(
         "✅ Токен обновлён.\n\nТвои VK-аккаунты:",
-        reply_markup=accounts_kb(update.effective_user.id),
+        reply_markup=accounts_kb(tid, context.user_data.get("current_account_id")),
     )
     return ConversationHandler.END
 
@@ -291,12 +330,11 @@ def resolve_vk_group(vk_token: str | None, text: str) -> tuple[int | None, str |
     return gid, fetch_group_name(vk_token, gid), None
 
 
-def groups_kb(telegram_id: int) -> InlineKeyboardMarkup:
+def groups_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboardMarkup:
     rows = []
-    for g in db.get_groups(telegram_id):
-        acc_label = f" · {g['account_name']}" if g["account_name"] else ""
+    for g in db.get_groups(telegram_id, account_id=account_id):
         rows.append([InlineKeyboardButton(
-            f"{g['name']} (id {g['vk_group_id']}){acc_label}", callback_data="noop"
+            f"{g['name']} (id {g['vk_group_id']})", callback_data="noop"
         )])
         rows.append([
             InlineKeyboardButton("✏️ Переименовать", callback_data=f"g_rename_{g['id']}"),
@@ -308,7 +346,10 @@ def groups_kb(telegram_id: int) -> InlineKeyboardMarkup:
 
 async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     db.ensure_user(update.effective_user.id)
-    await update.message.reply_text("Твои группы VK:", reply_markup=groups_kb(update.effective_user.id))
+    cur = _get_current_account(update.effective_user.id, context.user_data)
+    await update.message.reply_text(
+        "Твои группы VK:", reply_markup=groups_kb(update.effective_user.id, cur["id"] if cur else None)
+    )
     return ConversationHandler.END
 
 
@@ -323,33 +364,28 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     if data == "g_add":
         await query.answer()
-        accounts = db.get_accounts(telegram_id)
-        if not accounts:
+        cur = _get_current_account(telegram_id, context.user_data)
+        if not cur:
             await query.edit_message_text(
                 f"Сначала добавь хотя бы один VK-аккаунт ({BTN_ACCOUNTS})."
             )
             return ConversationHandler.END
-        if len(accounts) == 1:
-            context.user_data["pending_account_id"] = accounts[0]["id"]
-            context.user_data["pending_account_token"] = db.get_vk_token_by_account(accounts[0]["id"])
-            await query.edit_message_text(
-                "Пришли ссылку на сообщество VK:\n"
-                "• vk.com/club123456\n• vk.com/public123456\n• vk.com/my_group"
-            )
-            return G_ADD_ID
-        # Несколько аккаунтов — предлагаем выбрать
-        rows = [
-            [InlineKeyboardButton(f"👤 {a['name']}", callback_data=f"g_acc_{a['id']}")]
-            for a in accounts
-        ]
-        await query.edit_message_text("К какому аккаунту привязать группу?",
-                                      reply_markup=InlineKeyboardMarkup(rows))
-        return G_ADD_ACCOUNT
+        context.user_data["pending_account_id"] = cur["id"]
+        context.user_data["pending_account_token"] = db.get_vk_token_by_account(cur["id"])
+        await query.edit_message_text(
+            "Пришли ссылку на сообщество VK:\n"
+            "• vk.com/club123456\n• vk.com/public123456\n• vk.com/my_group"
+        )
+        return G_ADD_ID
 
     if data.startswith("g_del_"):
         await query.answer("Удалено")
         db.delete_group(int(data.rsplit("_", 1)[1]))
-        await query.edit_message_text("Твои группы VK:", reply_markup=groups_kb(telegram_id))
+        cur = _get_current_account(telegram_id, context.user_data)
+        await query.edit_message_text(
+            "Твои группы VK:",
+            reply_markup=groups_kb(telegram_id, cur["id"] if cur else None),
+        )
         return ConversationHandler.END
 
     if data.startswith("g_rename_"):
@@ -405,8 +441,10 @@ async def groups_add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query.data == "g_confirmname":
         db.add_group(telegram_id, context.user_data["pending_group_id"],
                      context.user_data["pending_group_name"], account_id)
-        await query.edit_message_text("✅ Группа добавлена.\n\nТвои группы VK:",
-                                      reply_markup=groups_kb(telegram_id))
+        await query.edit_message_text(
+            "✅ Группа добавлена.\n\nТвои группы VK:",
+            reply_markup=groups_kb(telegram_id, account_id),
+        )
         return ConversationHandler.END
     await query.edit_message_text("Введи название группы вручную:")
     return G_ADD_NAME
@@ -417,32 +455,33 @@ async def groups_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     account_id = context.user_data.get("pending_account_id")
     db.add_group(telegram_id, context.user_data["pending_group_id"],
                  update.message.text.strip(), account_id)
-    await update.message.reply_text("✅ Группа добавлена.\n\nТвои группы VK:",
-                                    reply_markup=groups_kb(telegram_id))
+    await update.message.reply_text(
+        "✅ Группа добавлена.\n\nТвои группы VK:",
+        reply_markup=groups_kb(telegram_id, account_id),
+    )
     return ConversationHandler.END
 
 
 async def groups_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     telegram_id = update.effective_user.id
+    cur = _get_current_account(telegram_id, context.user_data)
     db.rename_group(context.user_data["rename_group_id"], update.message.text.strip())
-    await update.message.reply_text("✅ Переименовано.\n\nТвои группы VK:",
-                                    reply_markup=groups_kb(telegram_id))
+    await update.message.reply_text(
+        "✅ Переименовано.\n\nТвои группы VK:",
+        reply_markup=groups_kb(telegram_id, cur["id"] if cur else None),
+    )
     return ConversationHandler.END
 
 
 # ─── Источники ────────────────────────────────────────────────────────────────
 
-def sources_kb(telegram_id: int) -> InlineKeyboardMarkup:
+def sources_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboardMarkup:
     rows = []
-    accounts = {a["id"]: a["name"] for a in db.get_accounts(telegram_id)}
-    multi_acc = len(accounts) > 1
-    for s in db.get_sources(telegram_id):
-        aid = s["account_id"] if "account_id" in s.keys() else None
-        acc_suffix = f" · {accounts[aid]}" if (multi_acc and aid and aid in accounts) else ""
+    for s in db.get_sources(telegram_id, for_account_id=account_id):
         if s["kind"] == "account":
-            label = f"🎵 {s['name']} (@{s['account']}){acc_suffix}"
+            label = f"🎵 {s['name']} (@{s['account']})"
         else:
-            label = f"🗄 {s['name']}" + (f" · @{s['username']}" if s["username"] else "") + acc_suffix
+            label = f"🗄 {s['name']}" + (f" · @{s['username']}" if s["username"] else "")
         rows.append([InlineKeyboardButton(label, callback_data="noop")])
         btn_row = []
         if s["kind"] == "account":
@@ -457,46 +496,44 @@ def sources_kb(telegram_id: int) -> InlineKeyboardMarkup:
 
 async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     db.ensure_user(update.effective_user.id)
-    await update.message.reply_text("Твои источники:", reply_markup=sources_kb(update.effective_user.id))
+    cur = _get_current_account(update.effective_user.id, context.user_data)
+    await update.message.reply_text(
+        "Твои источники:", reply_markup=sources_kb(update.effective_user.id, cur["id"] if cur else None)
+    )
     return ConversationHandler.END
 
 
 async def sources_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     data = query.data
+    telegram_id = update.effective_user.id
     if data == "noop":
         await query.answer()
         return ConversationHandler.END
     if data == "src_add":
         await query.answer()
-        accounts = db.get_accounts(update.effective_user.id)
-        if not accounts:
+        cur = _get_current_account(telegram_id, context.user_data)
+        if not cur:
             await query.edit_message_text(
                 f"Сначала добавь хотя бы один VK-аккаунт ({BTN_ACCOUNTS})."
             )
             return ConversationHandler.END
-        if len(accounts) == 1:
-            context.user_data["src_account_id"] = accounts[0]["id"]
-            await query.edit_message_text("Введи название источника (например «TikTok Batek»):")
-            return SRC_NAME
-        rows = [
-            [InlineKeyboardButton(f"👤 {a['name']}", callback_data=f"src_acc_{a['id']}")]
-            for a in accounts
-        ]
-        rows.append([InlineKeyboardButton("🌐 Без привязки к аккаунту", callback_data="src_acc_none")])
-        await query.edit_message_text(
-            "К какому аккаунту привязать источник?",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return SRC_ACCOUNT_PICK
+        context.user_data["src_account_id"] = cur["id"]
+        await query.edit_message_text("Введи название источника (например «TikTok Batek»):")
+        return SRC_NAME
     if data.startswith("src_del_"):
         await query.answer("Удалено")
         db.delete_source(int(data.rsplit("_", 1)[1]))
-        await query.edit_message_text("Твои источники:", reply_markup=sources_kb(update.effective_user.id))
+        cur = _get_current_account(telegram_id, context.user_data)
+        await query.edit_message_text(
+            "Твои источники:",
+            reply_markup=sources_kb(telegram_id, cur["id"] if cur else None),
+        )
         return ConversationHandler.END
     if data.startswith("src_refresh_"):
         await query.answer("Обновляю…")
-        await _refresh_source(query, int(data.rsplit("_", 1)[1]))
+        cur = _get_current_account(telegram_id, context.user_data)
+        await _refresh_source(query, int(data.rsplit("_", 1)[1]), cur["id"] if cur else None)
         return ConversationHandler.END
     if data.startswith("src_start_"):
         sid = int(data.rsplit("_", 1)[1])
@@ -506,10 +543,10 @@ async def sources_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return ConversationHandler.END
         await query.answer()
         context.user_data["src_start_id"] = sid
-        cur = s["parse_start"] if "parse_start" in s.keys() else 1
+        cur_start = s["parse_start"] if "parse_start" in s.keys() else 1
         await query.edit_message_text(
             f"С какого ролика начинать парсинг @{s['account']}?\n\n"
-            f"Сейчас: {cur} (1 = с самого свежего).\n"
+            f"Сейчас: {cur_start} (1 = с самого свежего).\n"
             "Пришли число (например 20 — пропустить 19 свежих и парсить окно старее).\n\n"
             "⚠️ Резервный embed-парсер отдаёт лишь последние ~10-30 роликов, "
             "поэтому большой старт сработает только пока yt-dlp читает аккаунт."
@@ -532,15 +569,16 @@ async def sources_start_save(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if sid is None:
         return ConversationHandler.END
     db.set_source_parse_start(sid, start)
+    cur = _get_current_account(update.effective_user.id, context.user_data)
     await update.message.reply_text(
         f"✅ Старт парсинга: {start}. Применится при следующем обновлении.\n\n"
         "Твои источники:",
-        reply_markup=sources_kb(update.effective_user.id),
+        reply_markup=sources_kb(update.effective_user.id, cur["id"] if cur else None),
     )
     return ConversationHandler.END
 
 
-async def _refresh_source(query, source_id: int) -> None:
+async def _refresh_source(query, source_id: int, account_id: int | None = None) -> None:
     s = db.get_source(source_id)
     if not s or s["kind"] != "account":
         return
@@ -557,18 +595,7 @@ async def _refresh_source(query, source_id: int) -> None:
     except Exception as exc:
         note = f"❌ Не удалось спарсить @{s['account']}:\n{exc}"
     await query.message.reply_text(note)
-    await query.message.reply_text("Твои источники:", reply_markup=sources_kb(s["telegram_id"]))
-
-
-async def sources_account_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    if query.data == "src_acc_none":
-        context.user_data["src_account_id"] = None
-    else:
-        context.user_data["src_account_id"] = int(query.data.rsplit("_", 1)[1])
-    await query.edit_message_text("Введи название источника (например «TikTok Batek»):")
-    return SRC_NAME
+    await query.message.reply_text("Твои источники:", reply_markup=sources_kb(s["telegram_id"], account_id))
 
 
 async def sources_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -621,7 +648,9 @@ async def sources_account(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         note = (f"⚠️ Источник добавлен, но первый парсинг не удался:\n{exc}\n"
                 "Можно повторить кнопкой «🔄 Обновить».")
     await update.message.reply_text(note)
-    await update.message.reply_text("Твои источники:", reply_markup=sources_kb(telegram_id))
+    await update.message.reply_text(
+        "Твои источники:", reply_markup=sources_kb(telegram_id, account_id)
+    )
     return ConversationHandler.END
 
 
@@ -648,16 +677,18 @@ async def sources_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     account_id = context.user_data.get("src_account_id")
     db.add_source(telegram_id, context.user_data["src_name"], context.user_data["src_path"],
                   username, kind="db", account_id=account_id)
-    await update.message.reply_text("✅ Источник добавлен.\n\nТвои источники:",
-                                    reply_markup=sources_kb(telegram_id))
+    await update.message.reply_text(
+        "✅ Источник добавлен.\n\nТвои источники:",
+        reply_markup=sources_kb(telegram_id, account_id),
+    )
     return ConversationHandler.END
 
 
 # ─── Правила ──────────────────────────────────────────────────────────────────
 
-def rules_kb(telegram_id: int) -> InlineKeyboardMarkup:
+def rules_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboardMarkup:
     rows = []
-    for r in db.get_rules(telegram_id):
+    for r in db.get_rules(telegram_id, account_id=account_id):
         mark = "🟢" if r["enabled"] else "⚪"
         rows.append([InlineKeyboardButton(
             f"{mark} {r['source_name']} → {r['group_name']}", callback_data=f"rule_open_{r['id']}"
@@ -725,7 +756,10 @@ async def _plan_and_notify(query, context, rule_id: int) -> None:
 
 async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     db.ensure_user(update.effective_user.id)
-    await update.message.reply_text("Твои правила публикации:", reply_markup=rules_kb(update.effective_user.id))
+    cur = _get_current_account(update.effective_user.id, context.user_data)
+    await update.message.reply_text(
+        "Твои правила публикации:", reply_markup=rules_kb(update.effective_user.id, cur["id"] if cur else None)
+    )
     return ConversationHandler.END
 
 
@@ -734,15 +768,20 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     data = query.data
     telegram_id = update.effective_user.id
 
+    cur_acc = _get_current_account(telegram_id, context.user_data)
+    cur_acc_id = cur_acc["id"] if cur_acc else None
+
     if data == "rule_list":
         await query.answer()
-        await query.edit_message_text("Твои правила публикации:", reply_markup=rules_kb(telegram_id))
+        await query.edit_message_text(
+            "Твои правила публикации:", reply_markup=rules_kb(telegram_id, cur_acc_id)
+        )
         return
 
     if data == "rule_add":
         await query.answer()
-        sources = db.get_sources(telegram_id)
-        groups = db.get_groups(telegram_id)
+        groups = db.get_groups(telegram_id, account_id=cur_acc_id)
+        sources = db.get_sources(telegram_id, for_account_id=cur_acc_id)
         if not sources or not groups:
             await query.edit_message_text(
                 "Сначала добавь хотя бы один источник и одну группу "
@@ -764,7 +803,7 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not sources:
             await query.edit_message_text(
                 f"Нет источников для этого аккаунта. Добавь источник ({BTN_SOURCES}).",
-                reply_markup=rules_kb(telegram_id),
+                reply_markup=rules_kb(telegram_id, cur_acc_id),
             )
             return
         rows = [[InlineKeyboardButton(s["name"], callback_data=f"rule_src_{s['id']}")] for s in sources]
@@ -776,15 +815,17 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         source_id = int(data.rsplit("_", 1)[1])
         group_id = context.user_data.get("new_rule_group")
         if not group_id:
-            await query.edit_message_text("Что-то пошло не так, начни заново.",
-                                          reply_markup=rules_kb(telegram_id))
+            await query.edit_message_text(
+                "Что-то пошло не так, начни заново.",
+                reply_markup=rules_kb(telegram_id, cur_acc_id),
+            )
             return
         try:
             rid = db.add_rule(telegram_id, source_id, group_id)
         except Exception:
             await query.edit_message_text(
                 "⚠️ Такое правило (этот источник → эта группа) уже существует.",
-                reply_markup=rules_kb(telegram_id),
+                reply_markup=rules_kb(telegram_id, cur_acc_id),
             )
             return
         r = db.get_rule(rid)
@@ -796,7 +837,7 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer()
         r = db.get_rule(int(data.rsplit("_", 1)[1]))
         if not r:
-            await query.edit_message_text("Правило не найдено.", reply_markup=rules_kb(telegram_id))
+            await query.edit_message_text("Правило не найдено.", reply_markup=rules_kb(telegram_id, cur_acc_id))
             return
         await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
         return
@@ -840,7 +881,9 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if data.startswith("rule_del_"):
         await query.answer("Удалено")
         db.delete_rule(int(data.rsplit("_", 1)[1]))
-        await query.edit_message_text("Твои правила публикации:", reply_markup=rules_kb(telegram_id))
+        await query.edit_message_text(
+            "Твои правила публикации:", reply_markup=rules_kb(telegram_id, cur_acc_id)
+        )
         return
 
     await query.answer()
@@ -939,12 +982,15 @@ def _parse_duration_input(text: str) -> tuple[int | None, int | None, str | None
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
     db.ensure_user(telegram_id)
-    rules = db.get_rules(telegram_id)
+    cur = _get_current_account(telegram_id, context.user_data)
+    cur_acc_id = cur["id"] if cur else None
+    rules = db.get_rules(telegram_id, account_id=cur_acc_id)
     if not rules:
         await update.message.reply_text("Пока нет ни одного правила. Добавь через 📋 Правила.")
         return
 
-    lines = ["📊 Статус автопубликации:\n"]
+    acc_label = f"🔑 Аккаунт: {cur['name']}\n" if cur else ""
+    lines = [f"📊 Статус автопубликации:\n{acc_label}"]
     for r in rules:
         mark = "🟢" if r["enabled"] else "⚪"
         published = db.count_published(r["id"])
@@ -1148,7 +1194,7 @@ def main() -> None:
 
     accounts_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(acc_button, pattern=r"^(acc_add|acc_rename_|acc_token_|acc_del_|noop$)"),
+            CallbackQueryHandler(acc_button, pattern=r"^(acc_add|acc_rename_|acc_token_|acc_del_|acc_switch_|noop$)"),
         ],
         states={
             ACC_NAME:         [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_name)],
@@ -1166,7 +1212,6 @@ def main() -> None:
             CallbackQueryHandler(groups_button, pattern=r"^(g_add|g_del_\d+|g_rename_\d+|noop$)"),
         ],
         states={
-            G_ADD_ACCOUNT: [CallbackQueryHandler(groups_account_select, pattern=r"^g_acc_\d+$")],
             G_ADD_ID:      [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_id)],
             G_ADD_CONFIRM: [CallbackQueryHandler(groups_add_confirm, pattern=r"^g_(confirmname|manualname)$")],
             G_ADD_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_name)],
@@ -1182,7 +1227,6 @@ def main() -> None:
             CallbackQueryHandler(sources_button, pattern=r"^(src_add|src_del_|src_refresh_|src_start_)"),
         ],
         states={
-            SRC_ACCOUNT_PICK: [CallbackQueryHandler(sources_account_pick, pattern=r"^src_acc_")],
             SRC_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_name)],
             SRC_TYPE:    [CallbackQueryHandler(sources_type, pattern=r"^src_type_(account|db)$")],
             SRC_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_account)],
