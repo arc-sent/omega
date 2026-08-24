@@ -62,17 +62,18 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS sources (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER NOT NULL,
-                name        TEXT NOT NULL,
-                db_path     TEXT NOT NULL,
-                username    TEXT,
-                kind        TEXT NOT NULL DEFAULT 'db',
-                account     TEXT,
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id   INTEGER NOT NULL,
+                name          TEXT NOT NULL,
+                db_path       TEXT NOT NULL,
+                username      TEXT,
+                kind          TEXT NOT NULL DEFAULT 'db',
+                account       TEXT,
+                account_id    INTEGER,
                 backfill_done INTEGER NOT NULL DEFAULT 0,
-                parse_start INTEGER NOT NULL DEFAULT 1,
+                parse_start   INTEGER NOT NULL DEFAULT 1,
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
-                UNIQUE (telegram_id, name)
+                FOREIGN KEY (account_id)  REFERENCES vk_accounts(id)   ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS rules (
@@ -156,6 +157,40 @@ def init_db() -> None:
         ]:
             if col not in src_cols:
                 conn.execute(f"ALTER TABLE sources ADD COLUMN {col} {defn}")
+
+        # Миграция: добавить account_id и снять уникальность по имени.
+        # SQLite не умеет DROP CONSTRAINT, поэтому пересоздаём таблицу.
+        src_cols = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
+        if "account_id" not in src_cols:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("""
+                CREATE TABLE sources_new (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id   INTEGER NOT NULL,
+                    name          TEXT NOT NULL,
+                    db_path       TEXT NOT NULL,
+                    username      TEXT,
+                    kind          TEXT NOT NULL DEFAULT 'db',
+                    account       TEXT,
+                    account_id    INTEGER,
+                    backfill_done INTEGER NOT NULL DEFAULT 0,
+                    parse_start   INTEGER NOT NULL DEFAULT 1,
+                    FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    FOREIGN KEY (account_id)  REFERENCES vk_accounts(id)   ON DELETE SET NULL
+                )
+            """)
+            conn.execute("""
+                INSERT INTO sources_new
+                    (id, telegram_id, name, db_path, username,
+                     kind, account, backfill_done, parse_start)
+                SELECT id, telegram_id, name, db_path, username,
+                       COALESCE(kind, 'db'), account,
+                       COALESCE(backfill_done, 0), COALESCE(parse_start, 1)
+                FROM sources
+            """)
+            conn.execute("DROP TABLE sources")
+            conn.execute("ALTER TABLE sources_new RENAME TO sources")
+            conn.execute("PRAGMA foreign_keys = ON")
 
         grp_cols = {row[1] for row in conn.execute("PRAGMA table_info(vk_groups)")}
         if "account_id" not in grp_cols:
@@ -347,8 +382,14 @@ def delete_group(group_row_id: int) -> None:
 
 # ─── Источники ────────────────────────────────────────────────────────────────
 
-def get_sources(telegram_id: int) -> list[sqlite3.Row]:
+def get_sources(telegram_id: int, *, for_account_id: int | None = None) -> list[sqlite3.Row]:
     with _connect() as conn:
+        if for_account_id is not None:
+            return conn.execute(
+                "SELECT * FROM sources WHERE telegram_id = ? "
+                "AND (account_id = ? OR account_id IS NULL) ORDER BY id",
+                (telegram_id, for_account_id),
+            ).fetchall()
         return conn.execute(
             "SELECT * FROM sources WHERE telegram_id = ? ORDER BY id", (telegram_id,)
         ).fetchall()
@@ -361,13 +402,14 @@ def get_source(source_id: int) -> sqlite3.Row | None:
 
 def add_source(
     telegram_id: int, name: str, db_path: str, username: str | None,
-    *, kind: str = "db", account: str | None = None,
+    *, kind: str = "db", account: str | None = None, account_id: int | None = None,
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO sources (telegram_id, name, db_path, username, kind, account) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (telegram_id, name, db_path, username, kind, account),
+            "INSERT INTO sources "
+            "(telegram_id, name, db_path, username, kind, account, account_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (telegram_id, name, db_path, username, kind, account, account_id),
         )
         return cur.lastrowid
 

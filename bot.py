@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # ─── Состояния разговоров ─────────────────────────────────────────────────────
 ACC_NAME, ACC_TOKEN, ACC_RENAME, ACC_CHANGE_TOKEN = range(10, 14)
 G_ADD_ID, G_ADD_CONFIRM, G_ADD_NAME, G_RENAME, G_ADD_ACCOUNT = range(20, 25)
-SRC_NAME, SRC_TYPE, SRC_ACCOUNT, SRC_PATH, SRC_USER, SRC_START = range(30, 36)
+SRC_NAME, SRC_TYPE, SRC_ACCOUNT, SRC_PATH, SRC_USER, SRC_START, SRC_ACCOUNT_PICK = range(30, 37)
 RULE_EDIT_VALUE = 40
 
 # ─── Постоянное меню ──────────────────────────────────────────────────────────
@@ -434,11 +434,15 @@ async def groups_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 def sources_kb(telegram_id: int) -> InlineKeyboardMarkup:
     rows = []
+    accounts = {a["id"]: a["name"] for a in db.get_accounts(telegram_id)}
+    multi_acc = len(accounts) > 1
     for s in db.get_sources(telegram_id):
+        aid = s["account_id"] if "account_id" in s.keys() else None
+        acc_suffix = f" · {accounts[aid]}" if (multi_acc and aid and aid in accounts) else ""
         if s["kind"] == "account":
-            label = f"🎵 {s['name']} (@{s['account']})"
+            label = f"🎵 {s['name']} (@{s['account']}){acc_suffix}"
         else:
-            label = f"🗄 {s['name']}" + (f" · @{s['username']}" if s["username"] else "")
+            label = f"🗄 {s['name']}" + (f" · @{s['username']}" if s["username"] else "") + acc_suffix
         rows.append([InlineKeyboardButton(label, callback_data="noop")])
         btn_row = []
         if s["kind"] == "account":
@@ -465,8 +469,26 @@ async def sources_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
     if data == "src_add":
         await query.answer()
-        await query.edit_message_text("Введи название источника (например «TikTok Batek»):")
-        return SRC_NAME
+        accounts = db.get_accounts(update.effective_user.id)
+        if not accounts:
+            await query.edit_message_text(
+                f"Сначала добавь хотя бы один VK-аккаунт ({BTN_ACCOUNTS})."
+            )
+            return ConversationHandler.END
+        if len(accounts) == 1:
+            context.user_data["src_account_id"] = accounts[0]["id"]
+            await query.edit_message_text("Введи название источника (например «TikTok Batek»):")
+            return SRC_NAME
+        rows = [
+            [InlineKeyboardButton(f"👤 {a['name']}", callback_data=f"src_acc_{a['id']}")]
+            for a in accounts
+        ]
+        rows.append([InlineKeyboardButton("🌐 Без привязки к аккаунту", callback_data="src_acc_none")])
+        await query.edit_message_text(
+            "К какому аккаунту привязать источник?",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return SRC_ACCOUNT_PICK
     if data.startswith("src_del_"):
         await query.answer("Удалено")
         db.delete_source(int(data.rsplit("_", 1)[1]))
@@ -538,6 +560,17 @@ async def _refresh_source(query, source_id: int) -> None:
     await query.message.reply_text("Твои источники:", reply_markup=sources_kb(s["telegram_id"]))
 
 
+async def sources_account_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "src_acc_none":
+        context.user_data["src_account_id"] = None
+    else:
+        context.user_data["src_account_id"] = int(query.data.rsplit("_", 1)[1])
+    await query.edit_message_text("Введи название источника (например «TikTok Batek»):")
+    return SRC_NAME
+
+
 async def sources_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["src_name"] = update.message.text.strip()
     kb = InlineKeyboardMarkup([
@@ -573,8 +606,9 @@ async def sources_account(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return SRC_ACCOUNT
 
     telegram_id = update.effective_user.id
+    account_id = context.user_data.get("src_account_id")
     sid = db.add_source(telegram_id, context.user_data["src_name"], "", None,
-                        kind="account", account=username)
+                        kind="account", account=username, account_id=account_id)
     path = account_source.source_db_path(sid)
     db.set_source_db_path(sid, path)
 
@@ -611,8 +645,9 @@ async def sources_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     raw = update.message.text.strip().lstrip("@")
     username = None if raw in ("-", "") else raw
     telegram_id = update.effective_user.id
+    account_id = context.user_data.get("src_account_id")
     db.add_source(telegram_id, context.user_data["src_name"], context.user_data["src_path"],
-                  username, kind="db")
+                  username, kind="db", account_id=account_id)
     await update.message.reply_text("✅ Источник добавлен.\n\nТвои источники:",
                                     reply_markup=sources_kb(telegram_id))
     return ConversationHandler.END
@@ -714,24 +749,33 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"({BTN_SOURCES}, {BTN_GROUPS})."
             )
             return
-        rows = [[InlineKeyboardButton(s["name"], callback_data=f"rule_src_{s['id']}")] for s in sources]
-        await query.edit_message_text("Выбери источник:", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("rule_src_"):
-        await query.answer()
-        context.user_data["new_rule_source"] = int(data.rsplit("_", 1)[1])
-        groups = db.get_groups(telegram_id)
         rows = [[InlineKeyboardButton(f"{g['name']} (id {g['vk_group_id']})",
                                       callback_data=f"rule_grp_{g['id']}")] for g in groups]
-        await query.edit_message_text("Теперь выбери группу:", reply_markup=InlineKeyboardMarkup(rows))
+        await query.edit_message_text("Выбери группу:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("rule_grp_"):
         await query.answer()
-        source_id = context.user_data.get("new_rule_source")
         group_id = int(data.rsplit("_", 1)[1])
-        if not source_id:
+        context.user_data["new_rule_group"] = group_id
+        group = db.get_group(group_id)
+        account_id = group["account_id"] if group else None
+        sources = db.get_sources(telegram_id, for_account_id=account_id)
+        if not sources:
+            await query.edit_message_text(
+                f"Нет источников для этого аккаунта. Добавь источник ({BTN_SOURCES}).",
+                reply_markup=rules_kb(telegram_id),
+            )
+            return
+        rows = [[InlineKeyboardButton(s["name"], callback_data=f"rule_src_{s['id']}")] for s in sources]
+        await query.edit_message_text("Теперь выбери источник:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("rule_src_"):
+        await query.answer()
+        source_id = int(data.rsplit("_", 1)[1])
+        group_id = context.user_data.get("new_rule_group")
+        if not group_id:
             await query.edit_message_text("Что-то пошло не так, начни заново.",
                                           reply_markup=rules_kb(telegram_id))
             return
@@ -1138,6 +1182,7 @@ def main() -> None:
             CallbackQueryHandler(sources_button, pattern=r"^(src_add|src_del_|src_refresh_|src_start_)"),
         ],
         states={
+            SRC_ACCOUNT_PICK: [CallbackQueryHandler(sources_account_pick, pattern=r"^src_acc_")],
             SRC_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_name)],
             SRC_TYPE:    [CallbackQueryHandler(sources_type, pattern=r"^src_type_(account|db)$")],
             SRC_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_account)],
