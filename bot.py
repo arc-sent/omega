@@ -35,6 +35,7 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split("
 ERROR_RETENTION_DAYS = int(os.getenv("ERROR_RETENTION_DAYS", "5"))
 ERROR_CLEANUP_INTERVAL_DAYS = int(os.getenv("ERROR_CLEANUP_INTERVAL_DAYS", "5"))
 ERRORS_PAGE_SIZE = 8
+GROUPS_PAGE_SIZE = 15
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -46,6 +47,8 @@ ACC_NAME, ACC_TOKEN, ACC_RENAME, ACC_CHANGE_TOKEN = range(10, 14)
 G_ADD_ID, G_ADD_CONFIRM, G_ADD_NAME, G_RENAME, G_ADD_ACCOUNT = range(20, 25)
 SRC_NAME, SRC_TYPE, SRC_ACCOUNT, SRC_PATH, SRC_USER, SRC_START = range(30, 36)
 RULE_EDIT_VALUE = 40
+RULE_DESC_PICK = 41
+T_TITLE, T_BODY = range(50, 52)
 
 # ─── Постоянное меню ──────────────────────────────────────────────────────────
 BTN_ACCOUNTS = "🔑 Аккаунты"
@@ -53,12 +56,13 @@ BTN_GROUPS = "👥 Группы"
 BTN_SOURCES = "🎬 Источники"
 BTN_RULES = "📋 Правила"
 BTN_STATUS = "📊 Статус"
-MENU_BUTTON_TEXTS = [BTN_ACCOUNTS, BTN_GROUPS, BTN_SOURCES, BTN_RULES, BTN_STATUS]
+BTN_TEMPLATES = "📝 Описания"
+MENU_BUTTON_TEXTS = [BTN_ACCOUNTS, BTN_GROUPS, BTN_SOURCES, BTN_RULES, BTN_STATUS, BTN_TEMPLATES]
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BTN_ACCOUNTS, BTN_GROUPS], [BTN_SOURCES, BTN_RULES], [BTN_STATUS]],
+        [[BTN_ACCOUNTS, BTN_GROUPS], [BTN_SOURCES, BTN_RULES], [BTN_STATUS, BTN_TEMPLATES]],
         resize_keyboard=True,
     )
 
@@ -117,6 +121,11 @@ async def main_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Твои правила публикации:", reply_markup=rules_kb(telegram_id, cur_acc_id))
     elif text == BTN_STATUS:
         await cmd_status(update, context)
+    elif text == BTN_TEMPLATES:
+        await update.message.reply_text(
+            "Твои заготовки описаний:",
+            reply_markup=build_templates_manage_keyboard(telegram_id),
+        )
 
 
 # ─── Аккаунты VK (токены) ─────────────────────────────────────────────────────
@@ -330,9 +339,13 @@ def resolve_vk_group(vk_token: str | None, text: str) -> tuple[int | None, str |
     return gid, fetch_group_name(vk_token, gid), None
 
 
-def groups_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboardMarkup:
+def groups_kb(telegram_id: int, account_id: int | None = None, page: int = 0) -> InlineKeyboardMarkup:
+    all_groups = db.get_groups(telegram_id, account_id=account_id)
+    total = len(all_groups)
+    pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
     rows = []
-    for g in db.get_groups(telegram_id, account_id=account_id):
+    for g in all_groups[page * GROUPS_PAGE_SIZE:(page + 1) * GROUPS_PAGE_SIZE]:
         rows.append([InlineKeyboardButton(
             f"{g['name']} (id {g['vk_group_id']})", callback_data="noop"
         )])
@@ -340,7 +353,63 @@ def groups_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboard
             InlineKeyboardButton("✏️ Переименовать", callback_data=f"g_rename_{g['id']}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"g_del_{g['id']}"),
         ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"g_page_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"g_page_{page + 1}"))
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("➕ Добавить группу", callback_data="g_add")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _rule_group_picker_kb(groups: list, page: int = 0) -> InlineKeyboardMarkup:
+    total = len(groups)
+    pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    rows = [[InlineKeyboardButton(f"{g['name']} (id {g['vk_group_id']})",
+                                  callback_data=f"rule_grp_{g['id']}")] for g in groups[page * GROUPS_PAGE_SIZE:(page + 1) * GROUPS_PAGE_SIZE]]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"rule_gpg_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"rule_gpg_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
+def build_templates_manage_keyboard(telegram_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    all_templates = db.get_templates(telegram_id)
+    total = len(all_templates)
+    pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for t in all_templates[page * GROUPS_PAGE_SIZE:(page + 1) * GROUPS_PAGE_SIZE]:
+        rows.append([InlineKeyboardButton(f"📝 {t['title']}", callback_data="noop")])
+        rows.append([
+            InlineKeyboardButton("✏️ Изменить", callback_data=f"t_edit_{t['id']}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"t_del_{t['id']}"),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"t_pg_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"t_pg_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("➕ Добавить заготовку", callback_data="t_add")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_desc_picker_kb(telegram_id: int) -> InlineKeyboardMarkup:
+    templates = db.get_templates(telegram_id)
+    rows = [[InlineKeyboardButton(f"📝 {t['title']}", callback_data=f"rule_tpl_{t['id']}")] for t in templates]
+    rows.append([
+        InlineKeyboardButton("✏️ Ввести вручную", callback_data="rule_desc_manual"),
+        InlineKeyboardButton("🗑 Очистить", callback_data="rule_desc_clear"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -377,6 +446,16 @@ async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             "• vk.com/club123456\n• vk.com/public123456\n• vk.com/my_group"
         )
         return G_ADD_ID
+
+    if data.startswith("g_page_"):
+        await query.answer()
+        page = int(data.rsplit("_", 1)[1])
+        cur = _get_current_account(telegram_id, context.user_data)
+        await query.edit_message_text(
+            "Твои группы VK:",
+            reply_markup=groups_kb(telegram_id, cur["id"] if cur else None, page),
+        )
+        return ConversationHandler.END
 
     if data.startswith("g_del_"):
         await query.answer("Удалено")
@@ -788,9 +867,14 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"({BTN_SOURCES}, {BTN_GROUPS})."
             )
             return
-        rows = [[InlineKeyboardButton(f"{g['name']} (id {g['vk_group_id']})",
-                                      callback_data=f"rule_grp_{g['id']}")] for g in groups]
-        await query.edit_message_text("Выбери группу:", reply_markup=InlineKeyboardMarkup(rows))
+        await query.edit_message_text("Выбери группу:", reply_markup=_rule_group_picker_kb(groups))
+        return
+
+    if data.startswith("rule_gpg_"):
+        await query.answer()
+        page = int(data.rsplit("_", 1)[1])
+        groups = db.get_groups(telegram_id, account_id=cur_acc_id)
+        await query.edit_message_text("Выбери группу:", reply_markup=_rule_group_picker_kb(groups, page))
         return
 
     if data.startswith("rule_grp_"):
@@ -902,10 +986,54 @@ async def rule_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
     _, field, rid = query.data.split("_")
-    context.user_data["edit_rule_id"] = int(rid)
+    rid = int(rid)
+    context.user_data["edit_rule_id"] = rid
     context.user_data["edit_rule_field"] = field
+    if field == "desc" and db.get_templates(update.effective_user.id):
+        await query.edit_message_text(
+            "Выбери заготовку или введи описание вручную:",
+            reply_markup=build_desc_picker_kb(update.effective_user.id),
+        )
+        return RULE_DESC_PICK
     await query.edit_message_text(_RULE_FIELD_PROMPTS[field])
     return RULE_EDIT_VALUE
+
+
+async def rule_desc_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    rid = context.user_data.get("edit_rule_id")
+    data = query.data
+
+    if data == "rule_desc_manual":
+        await query.edit_message_text(_RULE_FIELD_PROMPTS["desc"])
+        return RULE_EDIT_VALUE
+
+    if data == "rule_desc_clear":
+        db.update_rule(rid, description=None)
+        db.update_scheduled_posts_description(rid, None)
+        r = db.get_rule(rid)
+        context.user_data.pop("edit_rule_id", None)
+        context.user_data.pop("edit_rule_field", None)
+        await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
+        return ConversationHandler.END
+
+    if data.startswith("rule_tpl_"):
+        tpl_id = int(data.rsplit("_", 1)[1])
+        tpl = db.get_template(tpl_id)
+        new_desc = tpl["body"] if tpl else None
+        db.update_rule(rid, description=new_desc)
+        synced = db.update_scheduled_posts_description(rid, new_desc)
+        r = db.get_rule(rid)
+        msg = rule_detail_text(r)
+        if synced:
+            msg += f"\n\n📝 Применено к {synced} запланированным постам."
+        context.user_data.pop("edit_rule_id", None)
+        context.user_data.pop("edit_rule_field", None)
+        await query.edit_message_text(msg, reply_markup=rule_detail_kb(r))
+        return ConversationHandler.END
+
+    return RULE_DESC_PICK
 
 
 async def rule_edit_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -975,6 +1103,83 @@ def _parse_duration_input(text: str) -> tuple[int | None, int | None, str | None
     if lo is not None and hi is not None and lo > hi:
         return None, None, "Минимум больше максимума."
     return lo, hi, None
+
+
+# ─── Заготовки описаний ───────────────────────────────────────────────────────
+
+async def cmd_templates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    telegram_id = update.effective_user.id
+    db.ensure_user(telegram_id)
+    await update.message.reply_text(
+        "Твои заготовки описаний:",
+        reply_markup=build_templates_manage_keyboard(telegram_id),
+    )
+    return ConversationHandler.END
+
+
+async def templates_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    data = query.data
+    telegram_id = update.effective_user.id
+
+    if data.startswith("t_pg_"):
+        await query.answer()
+        page = int(data[len("t_pg_"):])
+        await query.edit_message_text(
+            "Твои заготовки описаний:",
+            reply_markup=build_templates_manage_keyboard(telegram_id, page),
+        )
+        return ConversationHandler.END
+
+    if data == "t_add":
+        await query.answer()
+        context.user_data.pop("edit_template_id", None)
+        await query.edit_message_text("Введи название заготовки (короткое, для себя):")
+        return T_TITLE
+
+    if data.startswith("t_del_"):
+        await query.answer("Удалено")
+        db.delete_template(int(data.rsplit("_", 1)[1]))
+        await query.edit_message_text(
+            "Твои заготовки описаний:",
+            reply_markup=build_templates_manage_keyboard(telegram_id),
+        )
+        return ConversationHandler.END
+
+    if data.startswith("t_edit_"):
+        await query.answer()
+        context.user_data["edit_template_id"] = int(data.rsplit("_", 1)[1])
+        await query.edit_message_text("Введи новое название заготовки:")
+        return T_TITLE
+
+    await query.answer()
+    return ConversationHandler.END
+
+
+async def templates_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["template_title"] = update.message.text.strip()
+    await update.message.reply_text("Теперь введи текст описания:")
+    return T_BODY
+
+
+async def templates_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    telegram_id = update.effective_user.id
+    title = context.user_data.get("template_title", "")
+    body = update.message.text
+    edit_id = context.user_data.get("edit_template_id")
+    if edit_id:
+        db.update_template(edit_id, title, body)
+        msg = "✅ Заготовка обновлена."
+    else:
+        db.add_template(telegram_id, title, body)
+        msg = "✅ Заготовка добавлена."
+    context.user_data.pop("edit_template_id", None)
+    context.user_data.pop("template_title", None)
+    await update.message.reply_text(
+        f"{msg}\n\nТвои заготовки описаний:",
+        reply_markup=build_templates_manage_keyboard(telegram_id),
+    )
+    return ConversationHandler.END
 
 
 # ─── Статус ───────────────────────────────────────────────────────────────────
@@ -1209,7 +1414,7 @@ def main() -> None:
     groups_conv = ConversationHandler(
         entry_points=[
             CommandHandler("groups", cmd_groups),
-            CallbackQueryHandler(groups_button, pattern=r"^(g_add|g_del_\d+|g_rename_\d+|noop$)"),
+            CallbackQueryHandler(groups_button, pattern=r"^(g_add|g_del_\d+|g_rename_\d+|g_page_\d+|noop$)"),
         ],
         states={
             G_ADD_ID:      [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_id)],
@@ -1240,9 +1445,32 @@ def main() -> None:
 
     rule_edit_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(rule_edit_start, pattern=r"^rule_(nday|slots|desc|dur)_\d+$")],
-        states={RULE_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, rule_edit_save)]},
+        states={
+            RULE_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, rule_edit_save)],
+            RULE_DESC_PICK: [CallbackQueryHandler(
+                rule_desc_pick,
+                pattern=r"^(rule_tpl_\d+|rule_desc_manual|rule_desc_clear)$",
+            )],
+        },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         conversation_timeout=300, name="rule_edit_conv", persistent=False, allow_reentry=True,
+    )
+
+    templates_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("templates", cmd_templates),
+            CallbackQueryHandler(templates_button, pattern=r"^(t_add|t_del_\d+|t_edit_\d+|t_pg_\d+|noop$)"),
+        ],
+        states={
+            T_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, templates_title)],
+            T_BODY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, templates_body)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        per_message=False,
+        conversation_timeout=300,
+        name="templates_conv",
+        persistent=False,
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1255,6 +1483,7 @@ def main() -> None:
     app.add_handler(accounts_conv)
     app.add_handler(groups_conv)
     app.add_handler(sources_conv)
+    app.add_handler(templates_conv)
     app.add_handler(rule_edit_conv)
     app.add_handler(CallbackQueryHandler(
         rules_button,

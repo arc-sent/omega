@@ -123,6 +123,14 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_sched_rule ON scheduled_posts (rule_id);
 
+            CREATE TABLE IF NOT EXISTS description_templates (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                title       TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS error_logs (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id   INTEGER NOT NULL,
@@ -688,6 +696,44 @@ def get_scheduled_posts() -> list[sqlite3.Row]:
 def delete_scheduled_post(post_id: int) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM scheduled_posts WHERE id = ?", (post_id,))
+
+
+# ─── Заготовки описаний ───────────────────────────────────────────────────────
+
+def get_templates(telegram_id: int) -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM description_templates WHERE telegram_id = ? ORDER BY id",
+            (telegram_id,),
+        ).fetchall()
+
+
+def get_template(template_id: int) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM description_templates WHERE id = ?", (template_id,)
+        ).fetchone()
+
+
+def add_template(telegram_id: int, title: str, body: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO description_templates (telegram_id, title, body) VALUES (?, ?, ?)",
+            (telegram_id, title, body),
+        )
+
+
+def update_template(template_id: int, title: str, body: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE description_templates SET title = ?, body = ? WHERE id = ?",
+            (title, body, template_id),
+        )
+
+
+def delete_template(template_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM description_templates WHERE id = ?", (template_id,))
 
 
 # ─── Логи ошибок ──────────────────────────────────────────────────────────────
