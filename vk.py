@@ -5,13 +5,58 @@
 отличать временные сбои (ретраить) от фатальных.
 """
 
+import itertools
 import logging
+import os
+import random
+import threading
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 VK_API_VERSION = "5.199"
+
+
+# ─── Прокси-ротатор ───────────────────────────────────────────────────────────
+
+def _build_proxy_dict(url: str) -> dict:
+    return {"http": url, "https": url}
+
+
+def _parse_proxy_list(env_val: str) -> list[dict]:
+    result = []
+    for part in env_val.split(","):
+        part = part.strip()
+        if part:
+            result.append(_build_proxy_dict(part))
+    return result
+
+
+class _ProxyRotator:
+    """Возвращает прокси для следующей загрузки с заданной вероятностью.
+
+    VK_PROXIES — список прокси через запятую (http://user:pass@host:port).
+    VK_PROXY_RATIO — доля загрузок через прокси (0.0–1.0, по умолчанию 1.0).
+    """
+
+    def __init__(self, proxies: list[dict], ratio: float):
+        self._proxies = proxies
+        self._ratio = max(0.0, min(1.0, ratio))
+        self._cycle = itertools.cycle(proxies) if proxies else None
+        self._lock = threading.Lock()
+
+    def next(self) -> dict | None:
+        """None — прямое соединение; dict — {'http': ..., 'https': ...}."""
+        if not self._cycle or random.random() > self._ratio:
+            return None
+        with self._lock:
+            return next(self._cycle)
+
+
+_raw_proxies = os.getenv("VK_PROXIES", "").strip()
+_proxy_ratio = float(os.getenv("VK_PROXY_RATIO", "1.0"))
+_PROXY_ROTATOR = _ProxyRotator(_parse_proxy_list(_raw_proxies), _proxy_ratio)
 
 # Коды ошибок VK, при которых имеет смысл повторить запрос.
 VK_RETRYABLE_ERROR_CODES = {1, 6, 9, 10}  # неизвестная / too many / flood / internal
@@ -94,7 +139,9 @@ def upload_to_vk(
     через publish_date, чтобы видео не появилось в разделе «Видео» раньше времени.
     """
     group_id = abs(int(vk_group_id))
-    logger.info("upload_to_vk: group_id=%s description=%r", group_id, description)
+    proxies = _PROXY_ROTATOR.next()
+    logger.info("upload_to_vk: group_id=%s via_proxy=%s description=%r",
+                group_id, proxies is not None, description)
 
     # ── Этап 1: video.save ────────────────────────────────────────────────
     stage = "VK video.save"
@@ -109,7 +156,8 @@ def upload_to_vk(
         save_data["description"] = description
     try:
         save_resp = requests.post(
-            "https://api.vk.com/method/video.save", data=save_data, timeout=30
+            "https://api.vk.com/method/video.save", data=save_data, timeout=30,
+            proxies=proxies,
         ).json()
     except requests.exceptions.RequestException as exc:
         raise VKError(None, f"сетевая ошибка: {exc}", stage=stage, network=True) from exc
@@ -127,7 +175,8 @@ def upload_to_vk(
     stage = "загрузка файла в VK"
     try:
         with open(file_path, "rb") as f:
-            upload_resp = requests.post(upload_url, files={"video_file": f}, timeout=300)
+            upload_resp = requests.post(upload_url, files={"video_file": f}, timeout=300,
+                                        proxies=proxies)
             upload_resp.raise_for_status()
             logger.info("video upload response: %s", upload_resp.text[:500])
     except requests.exceptions.RequestException as exc:
@@ -145,7 +194,8 @@ def upload_to_vk(
     }
     try:
         wall_resp = requests.post(
-            "https://api.vk.com/method/wall.post", data=wall_params, timeout=30
+            "https://api.vk.com/method/wall.post", data=wall_params, timeout=30,
+            proxies=proxies,
         ).json()
     except requests.exceptions.RequestException as exc:
         # Видео уже залито, запрос ушёл — ответ мог потеряться уже ПОСЛЕ создания
@@ -163,7 +213,7 @@ def upload_to_vk(
                 "https://api.vk.com/method/video.delete",
                 data={"access_token": vk_token, "v": VK_API_VERSION,
                       "owner_id": owner_id, "video_id": video_id},
-                timeout=30,
+                timeout=30, proxies=proxies,
             )
         except Exception:
             logger.exception("Не удалось откатить видео")
