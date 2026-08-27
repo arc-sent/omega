@@ -60,6 +60,22 @@ python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader
   «🔄 Обновить» в источнике (bot._refresh_source). Прогон парсера — в executor (блокирующий).
 - PARSE_LIMIT (env, 200) — сколько последних видео проверять за прогон.
 
+## Обработка видео (video_processor.py)
+- Режим хранится в `db.settings` (kv-таблица): `video_process_mode` (off/ultrafast/
+  superfast/veryfast/faster) и `video_downscale` (0/1). Читает планировщик, поэтому
+  БД, а не PicklePersistence. Меню «⚙️ Обработка» / `/process` — только ADMIN_IDS.
+- Встроено в `scheduler._process`, вызывается в `_publish_job` между `_download` и
+  `_publish_to_vk`. Executor + общий семафор VIDEO_PROCESS_CONCURRENCY (на 1 ядре — 1)
+  + `nice`, чтобы бот отвечал во время перекода.
+- **Инвариант**: обработка НИКОГДА не срывает публикацию. `process_video` не бросает
+  исключений, возвращает (путь, статус, деталь); при `failed` публикуется оригинал,
+  ошибка идёт в /errors, в «✅ Опубликовано» добавляется пометка.
+- Ролики длиннее VIDEO_PROCESS_MAX_DURATION (60 с) не обрабатываются (статус
+  `skipped`); неизвестная длительность обработку не отменяет.
+- Метаданные не стираются в пустоту: `-map_metadata -1` + правдоподобный набор
+  «снято на телефон» (creation_time, make/model/com.android.*, аппаратный encoder).
+  `-fflags/-flags +bitexact` глушит Lavf/Lavc; тег encoder потока перекрывается явно.
+
 ## Не сделано
 - Лимит длительности в .env (сейчас захардкожен в downloader.py, как в исходном боте).
 - Парсер только TikTok (наследие исходного проекта).

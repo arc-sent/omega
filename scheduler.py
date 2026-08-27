@@ -17,6 +17,7 @@ from datetime import datetime, time as dtime, timedelta
 import pytz
 
 import db
+import video_processor
 from downloader import (
     detect_platform, download_tiktok, download_likee, download_youtube, download_vk,
 )
@@ -39,9 +40,23 @@ DEEPEN_MAX_PASSES = int(os.getenv("DEEPEN_MAX_PASSES", "3"))
 
 PLATFORM_LABELS = {"tiktok": "TikTok", "likee": "Likee", "youtube": "YouTube Shorts", "vk": "VK"}
 
+# Сколько роликов перекодируется одновременно. На VPS с 1 ядром это 1: два
+# параллельных ffmpeg не ускоряют работу, а только съедают память и CPU у бота.
+VIDEO_PROCESS_CONCURRENCY = int(os.getenv("VIDEO_PROCESS_CONCURRENCY", "1"))
+
 # Семафор публикации на аккаунт: лимиты VK считаются по токену, поэтому
 # запросы одного аккаунта не идут лавиной, а разные аккаунты не блокируют друг друга.
 _vk_account_semaphores: dict[int, asyncio.Semaphore] = {}
+
+# Семафор обработки видео — общий на весь бот (ядро одно на всех).
+_video_semaphore: asyncio.Semaphore | None = None
+
+
+def _process_semaphore() -> asyncio.Semaphore:
+    global _video_semaphore
+    if _video_semaphore is None:
+        _video_semaphore = asyncio.Semaphore(VIDEO_PROCESS_CONCURRENCY)
+    return _video_semaphore
 
 
 def _account_semaphore(account_id: int) -> asyncio.Semaphore:
@@ -65,6 +80,49 @@ async def _download(url: str, vk_token: str | None) -> tuple[str, str]:
     if platform == "vk":
         return await download_vk(url, vk_token)
     raise ValueError(f"Не удалось определить платформу по ссылке: {url}")
+
+
+# ─── Обработка видео перед публикацией ────────────────────────────────────────
+
+async def _process(file_path: str, telegram_id: int, *, url: str | None = None,
+                   platform: str | None = None, vk_group_id: int | None = None,
+                   vk_group_name: str | None = None) -> tuple[str, str]:
+    """Прогнать скачанный ролик через video_processor согласно настройке.
+
+    Возвращает (путь для публикации, пометка для уведомления владельцу).
+    Перекодирование блокирующее (ffmpeg), поэтому уходит в executor: бот
+    продолжает отвечать на сообщения. Семафор не даёт двум роликам грузить
+    единственное ядро одновременно. Любой сбой обработки НЕ срывает публикацию —
+    уходит оригинал, а ошибка попадает в /errors.
+    """
+    mode = db.get_setting(video_processor.SETTING_MODE, video_processor.OFF)
+    if not video_processor.is_enabled(mode):
+        return file_path, ""
+    downscale = db.get_setting(video_processor.SETTING_DOWNSCALE, "0") == "1"
+
+    loop = asyncio.get_running_loop()
+    try:
+        async with _process_semaphore():
+            new_path, status, detail = await loop.run_in_executor(
+                None, video_processor.process_video, file_path, mode, downscale
+            )
+    except Exception as exc:  # сам вызов не должен ронять публикацию
+        logger.exception("Обработка видео: непредвиденный сбой")
+        _record_error(telegram_id, exc, stage="обработка видео", platform=platform,
+                      url=url, vk_group_id=vk_group_id, vk_group_name=vk_group_name)
+        return file_path, "⚠️ обработка не удалась — оригинал (см. /errors)"
+
+    if status == "done":
+        video_processor.cleanup(file_path)  # исходник больше не нужен
+        return new_path, f"🎬 {detail}"
+    if status == "skipped":
+        return file_path, f"🎬 без обработки ({detail})"
+    if status == "failed":
+        _record_error(telegram_id, RuntimeError(detail), stage="обработка видео",
+                      platform=platform, url=url, vk_group_id=vk_group_id,
+                      vk_group_name=vk_group_name)
+        return file_path, "⚠️ обработка не удалась — оригинал (см. /errors)"
+    return file_path, ""
 
 
 # ─── Публикация с семафором и ретраями ────────────────────────────────────────
@@ -466,6 +524,7 @@ async def _publish_job(context) -> None:
     vk_group_id = post["vk_group_id"]
     platform = detect_platform(url)
     file_path = None
+    proc_note = ""
 
     try:
         if not account_id:
@@ -477,6 +536,10 @@ async def _publish_job(context) -> None:
         file_path, title = await _download(url, vk_token)
         title = post["title"] or title
         sent_description = post["description"] or ""
+        file_path, proc_note = await _process(
+            file_path, telegram_id, url=url, platform=platform,
+            vk_group_id=vk_group_id, vk_group_name=group_name,
+        )
         await _publish_to_vk(account_id, vk_token, vk_group_id, file_path,
                              title, sent_description)
 
@@ -486,9 +549,10 @@ async def _publish_job(context) -> None:
         # того, что VK не показал текст). Можно убрать после разбора.
         desc_note = f"📝 {sent_description[:60]}" if sent_description else "📝 (пусто)"
         try:
-            await context.bot.send_message(
-                telegram_id, f"✅ Опубликовано в «{group_name}»: {url}\n{desc_note}"
-            )
+            text = f"✅ Опубликовано в «{group_name}»: {url}\n{desc_note}"
+            if proc_note:
+                text += f"\n{proc_note}"
+            await context.bot.send_message(telegram_id, text)
         except Exception:
             pass
         logger.info("Опубликовано rule=%s video=%s в «%s»", rule_id, post["tt_video_id"], group_name)

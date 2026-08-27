@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 import db
 import scheduler
 import account_source
+import video_processor
 from vk import resolve_screen_name, fetch_group_name
 from source_reader import check_source, fetch_candidates, SourceError
 
@@ -57,14 +58,17 @@ BTN_SOURCES = "🎬 Источники"
 BTN_RULES = "📋 Правила"
 BTN_STATUS = "📊 Статус"
 BTN_TEMPLATES = "📝 Описания"
-MENU_BUTTON_TEXTS = [BTN_ACCOUNTS, BTN_GROUPS, BTN_SOURCES, BTN_RULES, BTN_STATUS, BTN_TEMPLATES]
+BTN_PROCESS = "⚙️ Обработка"
+MENU_BUTTON_TEXTS = [BTN_ACCOUNTS, BTN_GROUPS, BTN_SOURCES, BTN_RULES, BTN_STATUS,
+                     BTN_TEMPLATES, BTN_PROCESS]
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[BTN_ACCOUNTS, BTN_GROUPS], [BTN_SOURCES, BTN_RULES], [BTN_STATUS, BTN_TEMPLATES]],
-        resize_keyboard=True,
-    )
+def main_keyboard(telegram_id: int | None = None) -> ReplyKeyboardMarkup:
+    """Постоянное меню. «Обработка» — только владельцу (ADMIN_IDS)."""
+    rows = [[BTN_ACCOUNTS, BTN_GROUPS], [BTN_SOURCES, BTN_RULES], [BTN_STATUS, BTN_TEMPLATES]]
+    if telegram_id is not None and _is_admin(telegram_id):
+        rows.append([BTN_PROCESS])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def _mask_token(token: str) -> str:
@@ -99,7 +103,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"3. {BTN_SOURCES} — добавь источники (базы парсера со ссылками).\n"
         f"4. {BTN_RULES} — свяжи источник с группой и настрой расписание.\n\n"
         "Дальше публикация идёт автоматически.",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(update.effective_user.id),
     )
 
 
@@ -126,6 +130,8 @@ async def main_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Твои заготовки описаний:",
             reply_markup=build_templates_manage_keyboard(telegram_id),
         )
+    elif text == BTN_PROCESS:
+        await cmd_process(update, context)
 
 
 # ─── Аккаунты VK (токены) ─────────────────────────────────────────────────────
@@ -237,7 +243,7 @@ async def acc_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def acc_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     if name in MENU_BUTTON_TEXTS:
-        await update.message.reply_text("Отменено.", reply_markup=main_keyboard())
+        await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
         return ConversationHandler.END
     context.user_data["acc_new_name"] = name
     await update.message.reply_text(VK_TOKEN_PROMPT)
@@ -247,7 +253,7 @@ async def acc_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def acc_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     token = update.message.text.strip()
     if token in MENU_BUTTON_TEXTS:
-        await update.message.reply_text("Отменено.", reply_markup=main_keyboard())
+        await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
         return ConversationHandler.END
     if not _is_valid_token(token):
         await update.message.reply_text("❌ Это не похоже на VK токен. Пришли правильный или /cancel.")
@@ -265,7 +271,7 @@ async def acc_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def acc_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     if name in MENU_BUTTON_TEXTS:
-        await update.message.reply_text("Отменено.", reply_markup=main_keyboard())
+        await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
         return ConversationHandler.END
     aid = context.user_data.pop("acc_edit_id", None)
     if aid:
@@ -281,7 +287,7 @@ async def acc_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def acc_change_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     token = update.message.text.strip()
     if token in MENU_BUTTON_TEXTS:
-        await update.message.reply_text("Отменено.", reply_markup=main_keyboard())
+        await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
         return ConversationHandler.END
     if not _is_valid_token(token):
         await update.message.reply_text("❌ Это не похоже на VK токен. Пришли правильный или /cancel.")
@@ -1221,6 +1227,91 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines))
 
 
+# ─── Обработка видео (только владелец) ────────────────────────────────────────
+
+def _process_settings() -> tuple[str, bool]:
+    mode = db.get_setting(video_processor.SETTING_MODE, video_processor.OFF)
+    downscale = db.get_setting(video_processor.SETTING_DOWNSCALE, "0") == "1"
+    return mode, downscale
+
+
+def process_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Экран настройки обработки: текущий режим + кнопки-переключатели."""
+    mode, downscale = _process_settings()
+    enabled = video_processor.is_enabled(mode)
+
+    if enabled:
+        p = video_processor.PRESETS[mode]
+        current = f"{p['label']} ({p['x264']}, CRF {p['crf']}, {p['eta']})"
+    else:
+        current = "выключено — видео публикуется как есть"
+
+    text = (
+        "⚙️ Обработка видео перед публикацией\n\n"
+        f"Сейчас: {current}\n"
+        f"Даунскейл до {video_processor.DOWNSCALE_SHORT_SIDE}p: "
+        f"{'✅ вкл' if downscale else '❌ выкл'}\n\n"
+        "Ролик перекодируется целиком (меняется хеш файла), метаданные TikTok "
+        "заменяются на правдоподобные «съёмка с телефона».\n"
+        f"Ролики длиннее {video_processor.MAX_DURATION} с публикуются без обработки.\n"
+        "Оценки времени — для минутного ролика на 1 ядре."
+    )
+
+    rows = [[InlineKeyboardButton(
+        ("✅ " if not enabled else "") + "Выключено",
+        callback_data=f"proc_set_{video_processor.OFF}")]]
+    for key, p in video_processor.PRESETS.items():
+        mark = "✅ " if mode == key else ""
+        rows.append([InlineKeyboardButton(
+            f"{mark}{p['label']} · {p['x264']} · {p['eta']}",
+            callback_data=f"proc_set_{key}")])
+    rows.append([InlineKeyboardButton(
+        f"📐 Даунскейл до {video_processor.DOWNSCALE_SHORT_SIDE}p: "
+        f"{'✅ вкл' if downscale else '❌ выкл'}",
+        callback_data="proc_ds")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        return  # не владелец — раздела просто не существует
+    text, kb = process_view()
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def process_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_admin(update.effective_user.id):
+        await query.answer("Недоступно", show_alert=True)
+        return
+    data = query.data
+
+    if data == "proc_ds":
+        mode, downscale = _process_settings()
+        db.set_setting(video_processor.SETTING_DOWNSCALE, "0" if downscale else "1")
+        note = (f"📐 Даунскейл до {video_processor.DOWNSCALE_SHORT_SIDE}p "
+                f"{'выключен' if downscale else 'включён'}.")
+        if not video_processor.is_enabled(mode):
+            note += " Заработает, когда включишь обработку."
+    else:
+        new_mode = data[len("proc_set_"):]
+        if new_mode != video_processor.OFF and not video_processor.is_enabled(new_mode):
+            await query.answer("Неизвестный режим")
+            return
+        db.set_setting(video_processor.SETTING_MODE, new_mode)
+        if new_mode == video_processor.OFF:
+            note = "✅ Обработка выключена — видео публикуется как есть."
+        else:
+            p = video_processor.PRESETS[new_mode]
+            note = (f"✅ Режим обработки: {p['label']} "
+                    f"({p['x264']}, CRF {p['crf']}, {p['eta']}).")
+        note += "\nПрименится к следующей публикации, включая уже запланированные."
+
+    await query.answer()
+    text, kb = process_view()
+    await query.edit_message_text(f"{note}\n\n{text}", reply_markup=kb)
+
+
 # ─── Ошибки / админ-панель ────────────────────────────────────────────────────
 
 def _is_admin(telegram_id: int) -> bool:
@@ -1373,7 +1464,7 @@ async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─── /cancel ──────────────────────────────────────────────────────────────────
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Отменено.", reply_markup=main_keyboard())
+    await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -1478,7 +1569,10 @@ def main() -> None:
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("errors", cmd_errors))
     app.add_handler(CommandHandler("admin", cmd_errors))
+    app.add_handler(CommandHandler("process", cmd_process))
     app.add_handler(CallbackQueryHandler(errors_callback, pattern=r"^err_"))
+    app.add_handler(CallbackQueryHandler(
+        process_button, pattern=r"^proc_(ds|set_(off|" + "|".join(video_processor.PRESETS) + r"))$"))
     app.add_handler(MessageHandler(filters.Text(MENU_BUTTON_TEXTS), main_menu_button))
     app.add_handler(accounts_conv)
     app.add_handler(groups_conv)
@@ -1495,6 +1589,9 @@ def main() -> None:
         _cleanup_errors_job, interval=timedelta(days=ERROR_CLEANUP_INTERVAL_DAYS),
         first=timedelta(minutes=1), name="cleanup_errors",
     )
+
+    if not ADMIN_IDS:
+        logger.warning("ADMIN_IDS пуст — раздел «Обработка видео» (/process) никому не доступен")
 
     logger.info("Автопостер запущен")
     app.run_polling()

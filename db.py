@@ -9,6 +9,7 @@
     rules            — правило = пара (источник → группа) + настройки публикации
     published        — что уже опубликовано по каждому правилу (дедуп)
     scheduled_posts  — запланированные публикации (переживают рестарт бота)
+    settings         — глобальные настройки бота (ключ→значение), переживают рестарт
     error_logs       — журнал ошибок для /errors и админ-панели
 """
 
@@ -129,6 +130,11 @@ def init_db() -> None:
                 title       TEXT NOT NULL,
                 body        TEXT NOT NULL,
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS error_logs (
@@ -696,6 +702,25 @@ def get_scheduled_posts() -> list[sqlite3.Row]:
 def delete_scheduled_post(post_id: int) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM scheduled_posts WHERE id = ?", (post_id,))
+
+
+# ─── Глобальные настройки ─────────────────────────────────────────────────────
+# Хранятся в БД, а не в PicklePersistence: их читает планировщик, у которого нет
+# user_data, и настройка должна пережить рестарт вместе с очередью публикаций.
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
 
 
 # ─── Заготовки описаний ───────────────────────────────────────────────────────
