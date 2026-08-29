@@ -57,15 +57,17 @@ BTN_GROUPS = "👥 Группы"
 BTN_SOURCES = "🎬 Источники"
 BTN_RULES = "📋 Правила"
 BTN_STATUS = "📊 Статус"
+BTN_STATS = "📈 Статистика"
 BTN_TEMPLATES = "📝 Описания"
 BTN_PROCESS = "⚙️ Обработка"
 MENU_BUTTON_TEXTS = [BTN_ACCOUNTS, BTN_GROUPS, BTN_SOURCES, BTN_RULES, BTN_STATUS,
-                     BTN_TEMPLATES, BTN_PROCESS]
+                     BTN_STATS, BTN_TEMPLATES, BTN_PROCESS]
 
 
 def main_keyboard(telegram_id: int | None = None) -> ReplyKeyboardMarkup:
     """Постоянное меню. «Обработка» — только владельцу (ADMIN_IDS)."""
-    rows = [[BTN_ACCOUNTS, BTN_GROUPS], [BTN_SOURCES, BTN_RULES], [BTN_STATUS, BTN_TEMPLATES]]
+    rows = [[BTN_ACCOUNTS, BTN_GROUPS], [BTN_SOURCES, BTN_RULES],
+            [BTN_STATUS, BTN_STATS], [BTN_TEMPLATES]]
     if telegram_id is not None and _is_admin(telegram_id):
         rows.append([BTN_PROCESS])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -125,6 +127,8 @@ async def main_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Твои правила публикации:", reply_markup=rules_kb(telegram_id, cur_acc_id))
     elif text == BTN_STATUS:
         await cmd_status(update, context)
+    elif text == BTN_STATS:
+        await cmd_stats(update, context)
     elif text == BTN_TEMPLATES:
         await update.message.reply_text(
             "Твои заготовки описаний:",
@@ -1227,6 +1231,103 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines))
 
 
+# ─── Статистика публикаций ────────────────────────────────────────────────────
+
+_STATS_PERIODS = {"today": "Сегодня", "week": "7 дней", "all": "Всё время"}
+
+
+def _stats_period_bounds(period: str) -> tuple[int, int]:
+    now = datetime.now(MOSCOW_TZ)
+    end_ts = int(now.timestamp())
+    if period == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_ts = int(start.timestamp())
+    elif period == "week":
+        start_ts = end_ts - 7 * 24 * 3600
+    else:
+        start_ts = 0
+    return start_ts, end_ts
+
+
+def _build_stats_text(telegram_id: int, period: str, user_data: dict) -> str:
+    cur = _get_current_account(telegram_id, user_data)
+    cur_acc_id = cur["id"] if cur else None
+    rules = db.get_rules(telegram_id, account_id=cur_acc_id)
+    if not rules:
+        return "Пока нет ни одного правила. Добавь через 📋 Правила."
+
+    start_ts, end_ts = _stats_period_bounds(period)
+    lines = [f"📈 Статистика публикаций · {_STATS_PERIODS[period]}\n"]
+    total_pub = total_q = total_avail = 0
+
+    for r in rules:
+        published = (
+            db.count_published(r["id"]) if period == "all"
+            else db.count_published_between(r["id"], start_ts, end_ts)
+        )
+        queued = len(db.get_scheduled_ids(r["id"]))
+        available_n = 0
+        available_s = "?"
+        try:
+            exclude = db.get_published_ids(r["id"]) | db.get_scheduled_ids(r["id"])
+            src = db.get_source(r["source_id"])
+            cands = fetch_candidates(
+                src["db_path"], username=src["username"],
+                min_duration=r["min_duration"], max_duration=r["max_duration"],
+                order_dir=r["order_dir"], exclude_ids=exclude,
+            )
+            available_n = len(cands)
+            available_s = str(available_n)
+        except SourceError:
+            available_s = "?"
+
+        total_pub += published
+        total_q += queued
+        total_avail += available_n
+        mark = "🟢" if r["enabled"] else "⚪"
+        lines.append(
+            f"{mark} {r['source_name']} → {r['group_name']}\n"
+            f"   ✅ Выложено: {published}   📅 В очереди: {queued}   📂 Осталось: {available_s}"
+        )
+
+    if len(rules) > 1:
+        lines.append(
+            f"\n📊 Итого: выложено {total_pub} · в очереди {total_q} · осталось {total_avail}"
+        )
+    return "\n".join(lines)
+
+
+def _stats_keyboard(current_period: str) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            ("✅ " if k == current_period else "") + label,
+            callback_data=f"stats_period_{k}",
+        )
+        for k, label in _STATS_PERIODS.items()
+    ]
+    return InlineKeyboardMarkup([buttons])
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    telegram_id = update.effective_user.id
+    db.ensure_user(telegram_id)
+    period = "today"
+    text = _build_stats_text(telegram_id, period, context.user_data)
+    await update.message.reply_text(text, reply_markup=_stats_keyboard(period))
+
+
+async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    period = query.data.replace("stats_period_", "")
+    if period not in _STATS_PERIODS:
+        return
+    telegram_id = query.from_user.id
+    db.ensure_user(telegram_id)
+    text = _build_stats_text(telegram_id, period, context.user_data)
+    await query.edit_message_text(text, reply_markup=_stats_keyboard(period))
+
+
 # ─── Обработка видео (только владелец) ────────────────────────────────────────
 
 def _process_settings() -> tuple[str, bool]:
@@ -1566,10 +1667,12 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("errors", cmd_errors))
     app.add_handler(CommandHandler("admin", cmd_errors))
     app.add_handler(CommandHandler("process", cmd_process))
+    app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats_period_"))
     app.add_handler(CallbackQueryHandler(errors_callback, pattern=r"^err_"))
     app.add_handler(CallbackQueryHandler(
         process_button, pattern=r"^proc_(ds|set_(off|" + "|".join(video_processor.PRESETS) + r"))$"))

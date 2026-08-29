@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 MAX_VIDEO_DURATION = 180  # секунд (3 минуты)
 
+# Прокси для скачивания видео (все платформы). Формат: http://user:pass@host:port
+DOWNLOAD_PROXY: str | None = os.getenv("DOWNLOAD_PROXY") or None
+
 
 # ─── HTTP сессия с ослабленным SSL ───────────────────────────────────────────
 
@@ -91,9 +94,15 @@ def _download_ytdlp_sync(
     save_path: str | None,
     prefix: str,
     default_title: str,
+    proxy: str | None = None,
 ) -> tuple[str, str]:
+    _proxy = proxy or DOWNLOAD_PROXY
+    meta_opts: dict = {"quiet": True, "no_warnings": True}
+    if _proxy:
+        meta_opts["proxy"] = _proxy
+
     # Фаза 1: получаем метаданные без скачивания — проверяем длительность
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+    with yt_dlp.YoutubeDL(meta_opts) as ydl:
         meta = ydl.extract_info(url, download=False)
     _check_duration(meta.get("duration"))
 
@@ -114,6 +123,8 @@ def _download_ytdlp_sync(
         # загрузок не будут конкурировать за один и тот же кэш-файл.
         "cachedir": os.path.join(tmpdir, ".cache"),
     }
+    if _proxy:
+        ydl_opts["proxy"] = _proxy
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         expected = ydl.prepare_filename(info)
@@ -134,12 +145,22 @@ def _download_ytdlp_sync(
     return _ensure_h264(candidate), title
 
 
+def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
+    try:
+        return _download_ytdlp_sync(url, save_path, "tiktok", "TikTok Video", proxy=None)
+    except ValueError:
+        raise  # видео слишком длинное — прокси не поможет
+    except Exception as first_err:
+        if not DOWNLOAD_PROXY:
+            raise
+        logger.warning("TikTok: прямое скачивание не удалось (%s) — повтор через прокси", first_err)
+        return _download_ytdlp_sync(url, save_path, "tiktok", "TikTok Video", proxy=DOWNLOAD_PROXY)
+
+
 async def download_tiktok(url: str, save_path: str | None = None) -> tuple[str, str]:
     """Возвращает (путь к файлу, название)."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, _download_ytdlp_sync, url, save_path, "tiktok", "TikTok Video"
-    )
+    return await loop.run_in_executor(None, _download_tiktok_sync, url, save_path)
 
 
 async def download_youtube(url: str, save_path: str | None = None) -> tuple[str, str]:
