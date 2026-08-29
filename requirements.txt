@@ -5,3 +5,4 @@ python-dotenv>=1.0.0
 pytz>=2024.1
 urllib3>=2.0.0
 cryptography>=42.0.0
+matplotlib>=3.8.0

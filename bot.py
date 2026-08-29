@@ -13,6 +13,10 @@ from io import BytesIO
 from datetime import datetime, timedelta
 
 import pytz
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -1298,14 +1302,84 @@ def _build_stats_text(telegram_id: int, period: str, user_data: dict) -> str:
 
 
 def _stats_keyboard(current_period: str) -> InlineKeyboardMarkup:
-    buttons = [
+    period_row = [
         InlineKeyboardButton(
             ("✅ " if k == current_period else "") + label,
             callback_data=f"stats_period_{k}",
         )
         for k, label in _STATS_PERIODS.items()
     ]
-    return InlineKeyboardMarkup([buttons])
+    chart_row = [InlineKeyboardButton("📊 График", callback_data=f"stats_chart_{current_period}")]
+    return InlineKeyboardMarkup([period_row, chart_row])
+
+
+def _build_stats_chart(telegram_id: int, period: str) -> bytes | None:
+    """Строит bar-chart публикаций за период. Возвращает PNG-байты или None если данных нет."""
+    start_ts, end_ts = _stats_period_bounds(period)
+    timestamps = db.get_published_timestamps_for_user(telegram_id, start_ts, end_ts)
+    if not timestamps:
+        return None
+
+    now = datetime.now(MOSCOW_TZ)
+
+    if period == "today":
+        # Группируем по часам 0-23
+        buckets: dict[int, int] = {h: 0 for h in range(24)}
+        for ts in timestamps:
+            hour = datetime.fromtimestamp(ts, tz=MOSCOW_TZ).hour
+            buckets[hour] = buckets.get(hour, 0) + 1
+        labels = [f"{h:02d}:00" for h in range(24)]
+        values = [buckets[h] for h in range(24)]
+        xlabel = "Час (МСК)"
+        title = f"Публикации за сегодня, {now.strftime('%d.%m.%Y')}"
+    elif period == "week":
+        # Группируем по дням за последние 7 дней
+        days = [(now - timedelta(days=i)).date() for i in range(6, -1, -1)]
+        buckets2: dict = {d: 0 for d in days}
+        for ts in timestamps:
+            d = datetime.fromtimestamp(ts, tz=MOSCOW_TZ).date()
+            if d in buckets2:
+                buckets2[d] += 1
+        labels = [d.strftime("%d.%m") for d in days]
+        values = [buckets2[d] for d in days]
+        xlabel = "Дата"
+        title = "Публикации за 7 дней"
+    else:
+        # Все данные: группируем по дням
+        dates_set: dict = {}
+        for ts in timestamps:
+            d = datetime.fromtimestamp(ts, tz=MOSCOW_TZ).date()
+            dates_set[d] = dates_set.get(d, 0) + 1
+        sorted_dates = sorted(dates_set.keys())
+        labels = [d.strftime("%d.%m") for d in sorted_dates]
+        values = [dates_set[d] for d in sorted_dates]
+        xlabel = "Дата"
+        title = "Публикации за всё время"
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    bar_color = "#5b9bd5"
+    bars = ax.bar(range(len(labels)), values, color=bar_color, width=0.6, zorder=3)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45 if len(labels) > 10 else 0,
+                       ha="right" if len(labels) > 10 else "center", fontsize=9)
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_ylabel("Роликов", fontsize=10)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.yaxis.get_major_locator().set_params(integer=True)
+    ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    # Подписи значений на столбцах
+    for bar, val in zip(bars, values):
+        if val > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                    str(val), ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1326,6 +1400,22 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     db.ensure_user(telegram_id)
     text = _build_stats_text(telegram_id, period, context.user_data)
     await query.edit_message_text(text, reply_markup=_stats_keyboard(period))
+
+
+async def stats_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    period = query.data.replace("stats_chart_", "")
+    if period not in _STATS_PERIODS:
+        return
+    telegram_id = query.from_user.id
+    db.ensure_user(telegram_id)
+    chart = _build_stats_chart(telegram_id, period)
+    if chart is None:
+        await query.answer("Нет данных для графика за этот период.", show_alert=True)
+        return
+    caption = f"📊 График публикаций · {_STATS_PERIODS[period]}"
+    await query.message.reply_photo(photo=BytesIO(chart), caption=caption)
 
 
 # ─── Обработка видео (только владелец) ────────────────────────────────────────
@@ -1673,6 +1763,7 @@ def main() -> None:
     app.add_handler(CommandHandler("admin", cmd_errors))
     app.add_handler(CommandHandler("process", cmd_process))
     app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats_period_"))
+    app.add_handler(CallbackQueryHandler(stats_chart_callback, pattern=r"^stats_chart_"))
     app.add_handler(CallbackQueryHandler(errors_callback, pattern=r"^err_"))
     app.add_handler(CallbackQueryHandler(
         process_button, pattern=r"^proc_(ds|set_(off|" + "|".join(video_processor.PRESETS) + r"))$"))

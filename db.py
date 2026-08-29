@@ -625,6 +625,22 @@ def count_published(rule_id: int) -> int:
     return row["c"] if row else 0
 
 
+def get_published_timestamps_for_user(telegram_id: int, start_ts: int, end_ts: int) -> list[int]:
+    """Все метки времени публикаций пользователя за период (для построения графиков)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.published_at
+            FROM published p
+            JOIN rules r ON r.id = p.rule_id
+            WHERE r.telegram_id = ? AND p.published_at >= ? AND p.published_at < ?
+            ORDER BY p.published_at
+            """,
+            (telegram_id, start_ts, end_ts),
+        ).fetchall()
+    return [r["published_at"] for r in rows]
+
+
 def count_published_between(rule_id: int, start_ts: int, end_ts: int) -> int:
     with _connect() as conn:
         row = conn.execute(
