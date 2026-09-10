@@ -30,7 +30,9 @@ MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 VK_PUBLISH_CONCURRENCY = int(os.getenv("VK_PUBLISH_CONCURRENCY", "1"))
 VK_PUBLISH_RETRIES = int(os.getenv("VK_PUBLISH_RETRIES", "3"))
 VK_RETRY_BASE_DELAY = float(os.getenv("VK_RETRY_BASE_DELAY", "3"))
-PUBLISH_JITTER_SECONDS = int(os.getenv("PUBLISH_JITTER_SECONDS", "300"))
+# Публикации равномерно раскладываются внутри этого окна (не постим ночью).
+PUBLISH_WINDOW_START_HOUR = int(os.getenv("PUBLISH_WINDOW_START_HOUR", "9"))
+PUBLISH_WINDOW_END_HOUR = int(os.getenv("PUBLISH_WINDOW_END_HOUR", "22"))
 DAILY_PLAN_HOUR = int(os.getenv("DAILY_PLAN_HOUR", "0"))
 DAILY_PLAN_MINUTE = int(os.getenv("DAILY_PLAN_MINUTE", "5"))
 # Автодопарсинг истории: держим запас невыложенных кандидатов на столько дневных
@@ -176,30 +178,40 @@ def parse_slots(slots_csv: str) -> list[int]:
     return sorted(hours)
 
 
-def _base_slot_times(slots: list[int], now: datetime) -> list[datetime]:
-    """Слоты ближайшей раскладки: будущие слоты сегодня, иначе — все слоты завтра."""
-    def slot_dt(date, h):
-        return MOSCOW_TZ.localize(datetime(date.year, date.month, date.day, h))
+def _publish_window(now: datetime) -> tuple[datetime, datetime]:
+    """Окно равномерной раскладки: сегодняшнее (PUBLISH_WINDOW_START_HOUR..END_HOUR),
+    если в нём ещё есть будущее время, иначе — окно завтрашнего дня целиком."""
+    def window_for(date):
+        start = MOSCOW_TZ.localize(datetime(date.year, date.month, date.day, PUBLISH_WINDOW_START_HOUR))
+        end = MOSCOW_TZ.localize(datetime(date.year, date.month, date.day, PUBLISH_WINDOW_END_HOUR))
+        return start, end
 
     today = now.date()
-    base = [slot_dt(today, h) for h in slots if slot_dt(today, h) > now + timedelta(minutes=2)]
-    if not base:
-        tomorrow = today + timedelta(days=1)
-        base = [slot_dt(tomorrow, h) for h in slots]
-    return base
+    start, end = window_for(today)
+    floor = now + timedelta(minutes=2)
+    if floor < end:
+        return max(start, floor), end
+    return window_for(today + timedelta(days=1))
 
 
-def compute_publish_times(slots: list[int], n: int, now: datetime) -> list[datetime]:
-    """Вернуть n моментов публикации, распределяя видео по слотам.
+def compute_publish_times(total: int, already: int, count: int, now: datetime) -> list[datetime]:
+    """Вернуть count моментов публикации, равномерно раскиданных по окну публикации.
 
-    Используются только будущие слоты сегодня; если на сегодня их не осталось —
-    берутся слоты завтрашнего дня. Если видео больше, чем слотов, они идут по
-    кругу (несколько на слот — джиттер их разнесёт).
+    Окно делится на `total` (дневная квота правила) равных интервалов; этот вызов
+    забирает интервалы [already, already+count). Так несколько прогонов планирования
+    за один день (рестарт + ежедневный job) не садятся в одну точку, а продолжают
+    тот же ровный график — вместо кучкования вокруг нескольких фиксированных часов
+    поток публикаций размазан по всему дню без резких скачков.
     """
-    if n <= 0 or not slots:
+    if count <= 0 or total <= 0:
         return []
-    base = _base_slot_times(slots, now)
-    return [base[i % len(base)] for i in range(n)]
+    start, end = _publish_window(now)
+    step = (end - start).total_seconds() / total
+    times = []
+    for i in range(already, already + count):
+        offset = random.uniform(i * step, (i + 1) * step)
+        times.append(start + timedelta(seconds=offset))
+    return times
 
 
 # ─── Планирование правила ─────────────────────────────────────────────────────
@@ -223,7 +235,6 @@ def plan_rule(job_queue, rule) -> int:
     from source_reader import fetch_candidates, SourceError
 
     rule_id = rule["id"]
-    slots = parse_slots(rule["slots"])
     now = datetime.now(MOSCOW_TZ)
 
     # Дневная квота: N видео В ДЕНЬ, а не за вызов. Считаем, сколько по этому
@@ -238,18 +249,11 @@ def plan_rule(job_queue, rule) -> int:
     if remaining <= 0:
         return 0
 
-    # Пропущенное за сегодня НЕ «догоняем»: ставим максимум по одному ролику на
-    # слот и только на СВОБОДНЫЕ будущие слоты. Слот считаем занятым, если по
-    # этому правилу в его пределах (в течение часа) уже стоит публикация — так
-    # повторные прогоны/рестарты в пределах дня не сваливают пачку в один слот.
-    base_times = _base_slot_times(slots, now) if slots else []
-    taken = db.get_scheduled_publish_times(rule_id)
-    free_times = [
-        t for t in base_times
-        if not any(int(t.timestamp()) <= at < int(t.timestamp()) + 3600 for at in taken)
-    ]
-    remaining = min(remaining, len(free_times))
-    if remaining <= 0:
+    # Равномерная раскладка: окно делится на videos_per_day интервалов, этот
+    # прогон забирает следующие `remaining` (продолжая с индекса `already`) —
+    # повторные прогоны/рестарты в пределах дня не задваивают и не кучкуются.
+    times = compute_publish_times(rule["videos_per_day"], already, remaining, now)
+    if not times:
         return 0
 
     # Исключаем уже опубликованные И уже стоящие в очереди — чтобы не задвоить.
@@ -297,13 +301,11 @@ def plan_rule(job_queue, rule) -> int:
         if not candidates:
             return 0
 
-    # По одному ролику на свободный слот (кандидатов не больше, чем свободных слотов).
-    times = free_times[:len(candidates)]
+    times = times[:len(candidates)]
 
     scheduled = 0
-    for video, base_time in zip(candidates, times):
-        jitter = random.randint(0, PUBLISH_JITTER_SECONDS)
-        publish_at = int(base_time.timestamp()) + jitter
+    for video, publish_time in zip(candidates, times):
+        publish_at = int(publish_time.timestamp())
         post_id = db.add_scheduled_post(
             telegram_id=rule["telegram_id"],
             rule_id=rule_id,

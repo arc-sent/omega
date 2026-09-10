@@ -16,30 +16,55 @@ def test_parse_slots():
     assert scheduler.parse_slots("") == []
 
 
-def test_base_slot_times_future_today():
+def test_publish_window_within_today():
     now = MOSCOW_TZ.localize(datetime(2026, 7, 23, 10, 0))
-    times = scheduler._base_slot_times([9, 15, 20], now)
-    # 9 уже прошёл, остаются 15 и 20 сегодня
-    assert [t.hour for t in times] == [15, 20]
-    assert all(t.date() == now.date() for t in times)
+    start, end = scheduler._publish_window(now)
+    assert start.date() == now.date() and end.date() == now.date()
+    assert start.hour == 10 and start.minute == 2  # окно уже началось -> от текущего момента
+    assert end.hour == scheduler.PUBLISH_WINDOW_END_HOUR
 
 
-def test_base_slot_times_rolls_to_tomorrow():
+def test_publish_window_before_start_uses_window_start():
+    now = MOSCOW_TZ.localize(datetime(2026, 7, 23, 3, 0))
+    start, end = scheduler._publish_window(now)
+    assert start.hour == scheduler.PUBLISH_WINDOW_START_HOUR
+    assert start.date() == now.date()
+
+
+def test_publish_window_rolls_to_tomorrow():
     now = MOSCOW_TZ.localize(datetime(2026, 7, 23, 22, 0))
-    times = scheduler._base_slot_times([9, 15, 20], now)
-    # все сегодняшние слоты прошли -> завтрашние
-    assert [t.hour for t in times] == [9, 15, 20]
-    assert all(t.date() == now.date() + timedelta(days=1) for t in times)
+    start, end = scheduler._publish_window(now)
+    # окно сегодня уже кончилось -> целиком завтрашнее
+    assert start.date() == now.date() + timedelta(days=1)
+    assert start.hour == scheduler.PUBLISH_WINDOW_START_HOUR
+    assert end.hour == scheduler.PUBLISH_WINDOW_END_HOUR
 
 
-def test_compute_publish_times_wraps_over_slots():
+def test_compute_publish_times_spread_evenly_in_window():
     now = MOSCOW_TZ.localize(datetime(2026, 7, 23, 0, 0))
-    times = scheduler.compute_publish_times([9, 15], 3, now)
-    assert len(times) == 3
-    assert [t.hour for t in times] == [9, 15, 9]  # по кругу
+    times = scheduler.compute_publish_times(4, 0, 4, now)
+    assert len(times) == 4
+    # монотонно возрастают и не выходят за пределы окна
+    start, end = scheduler._publish_window(now)
+    assert all(start <= t < end for t in times)
+    assert times == sorted(times)
+    # ни одна пара не кучкуется в одной узкой точке — раскиданы по четвертям окна
+    span = (end - start).total_seconds()
+    step = span / 4
+    for i, t in enumerate(times):
+        offset = (t - start).total_seconds()
+        assert i * step <= offset < (i + 1) * step
+
+
+def test_compute_publish_times_continues_from_already():
+    """Повторный прогон (already>0) продолжает график, а не начинает заново."""
+    now = MOSCOW_TZ.localize(datetime(2026, 7, 23, 0, 0))
+    first = scheduler.compute_publish_times(4, 0, 2, now)
+    second = scheduler.compute_publish_times(4, 2, 2, now)
+    assert max(first) < min(second)
 
 
 def test_compute_publish_times_empty():
     now = MOSCOW_TZ.localize(datetime(2026, 7, 23, 0, 0))
-    assert scheduler.compute_publish_times([], 3, now) == []
-    assert scheduler.compute_publish_times([9], 0, now) == []
+    assert scheduler.compute_publish_times(0, 0, 3, now) == []
+    assert scheduler.compute_publish_times(4, 0, 0, now) == []
