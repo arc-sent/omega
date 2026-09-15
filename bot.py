@@ -1209,7 +1209,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     acc_label = f"🔑 Аккаунт: {cur['name']}\n" if cur else ""
-    lines = [f"📊 Статус автопубликации:\n{acc_label}"]
+    pause_note = "⏸ Публикация ОСТАНОВЛЕНА (/startBot — включить)\n\n" if scheduler.is_publishing_paused() else ""
+    lines = [f"{pause_note}📊 Статус автопубликации:\n{acc_label}"]
     for r in rules:
         mark = "🟢" if r["enabled"] else "⚪"
         published = db.count_published(r["id"])
@@ -1652,6 +1653,28 @@ async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Очистка логов ошибок: удалено %s записей", deleted)
 
 
+# ─── /stop, /startBot — глобальная пауза публикации ───────────────────────────
+
+async def cmd_stop_publishing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    telegram_id = update.effective_user.id
+    if not _is_admin(telegram_id):
+        return
+    scheduler.set_publishing_paused(True)
+    await update.message.reply_text(
+        "⏸ Публикация остановлена. Уже стоящие в очереди видео публиковаться не "
+        "будут, пока не пришлёшь /startBot. Планирование (раскладка новых видео "
+        "по слотам) продолжается — просто ничего не будет уходить в VK."
+    )
+
+
+async def cmd_start_publishing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    telegram_id = update.effective_user.id
+    if not _is_admin(telegram_id):
+        return
+    scheduler.set_publishing_paused(False)
+    await update.message.reply_text("▶️ Публикация возобновлена.")
+
+
 # ─── /cancel ──────────────────────────────────────────────────────────────────
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1761,6 +1784,8 @@ def main() -> None:
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("errors", cmd_errors))
     app.add_handler(CommandHandler("admin", cmd_errors))
+    app.add_handler(CommandHandler("stop", cmd_stop_publishing))
+    app.add_handler(CommandHandler("startBot", cmd_start_publishing))
     app.add_handler(CommandHandler("process", cmd_process))
     app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats_period_"))
     app.add_handler(CallbackQueryHandler(stats_chart_callback, pattern=r"^stats_chart_"))

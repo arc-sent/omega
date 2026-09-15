@@ -35,12 +35,27 @@ PUBLISH_WINDOW_START_HOUR = int(os.getenv("PUBLISH_WINDOW_START_HOUR", "9"))
 PUBLISH_WINDOW_END_HOUR = int(os.getenv("PUBLISH_WINDOW_END_HOUR", "22"))
 DAILY_PLAN_HOUR = int(os.getenv("DAILY_PLAN_HOUR", "0"))
 DAILY_PLAN_MINUTE = int(os.getenv("DAILY_PLAN_MINUTE", "5"))
+# Пока публикация на паузе (/stop), _publish_job не публикует, а переставляет
+# сам себя на повторную проверку через этот интервал — пост не теряется из очереди.
+PUBLISH_PAUSE_RECHECK_SECONDS = int(os.getenv("PUBLISH_PAUSE_RECHECK_SECONDS", "60"))
 # Автодопарсинг истории: держим запас невыложенных кандидатов на столько дневных
 # норм вперёд; если меньше — углубляемся в историю (не больше N проходов за раз).
 BACKLOG_DAYS = int(os.getenv("BACKLOG_DAYS", "3"))
 DEEPEN_MAX_PASSES = int(os.getenv("DEEPEN_MAX_PASSES", "3"))
 
 PLATFORM_LABELS = {"tiktok": "TikTok", "likee": "Likee", "youtube": "YouTube Shorts", "vk": "VK"}
+
+# ─── Глобальная пауза публикации (/stop, /startBot) ───────────────────────────
+# Хранится в db.settings — переживает рестарт, читается планировщиком в _publish_job.
+_PUBLISHING_PAUSED_KEY = "publishing_paused"
+
+
+def is_publishing_paused() -> bool:
+    return db.get_setting(_PUBLISHING_PAUSED_KEY, "0") == "1"
+
+
+def set_publishing_paused(paused: bool) -> None:
+    db.set_setting(_PUBLISHING_PAUSED_KEY, "1" if paused else "0")
 
 # Сколько роликов перекодируется одновременно. На VPS с 1 ядром это 1: два
 # параллельных ffmpeg не ускоряют работу, а только съедают память и CPU у бота.
@@ -502,6 +517,17 @@ async def daily_plan_job(context) -> None:
 async def _publish_job(context) -> None:
     """Публикация одного запланированного видео в момент слота."""
     post_id = context.job.data["scheduled_post_id"]
+
+    # Публикация остановлена командой /stop: пост не публикуем и не теряем —
+    # переставляем job на повторную проверку через PUBLISH_PAUSE_RECHECK_SECONDS.
+    if is_publishing_paused():
+        context.job_queue.run_once(
+            _publish_job,
+            when=timedelta(seconds=PUBLISH_PAUSE_RECHECK_SECONDS),
+            data={"scheduled_post_id": post_id},
+            name=f"post_{post_id}",
+        )
+        return
 
     # Актуальная строка из БД (правило могли удалить/выключить, токен сменить).
     posts = {p["id"]: p for p in db.get_scheduled_posts()}
