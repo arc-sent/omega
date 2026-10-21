@@ -55,14 +55,18 @@ Telegram-бот, который автоматически публикует в
 
 ## Проверка после изменений
 ```bash
-python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader.py
+python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader.py account_source.py parser_youtube.py
+python -m pytest -q
 # логика без сети: DATA_DIR=$(mktemp -d), init_db, plan_rule с фейковым job_queue
 ```
 Реальную публикацию/Telegram локально не гоняем (нужны токены). bot.py импортируется
 без запуска polling — этого достаточно для smoke-теста хендлеров.
 
 ## Источники-аккаунты (парсер встроен — Фаза 3 сделана)
-- `sources.kind` = 'db' (внешний путь) | 'account' (TikTok, бот парсит сам).
+- `sources.kind` = 'db' (внешний путь) | 'account' (бот парсит сам).
+- `sources.platform` = 'tiktok' (по умолчанию, все старые источники) | 'youtube'
+  (шортсы канала) — какой парсер ведёт account-источник. Платформа прокидывается в
+  refresh_account/deepen_account из scheduler и bot (`_source_platform`).
 - Для account: `sources.account` = ник, `db_path` = data/sources/<id>.db (ведёт бот).
 - `parser_tiktok.py` — копия парсера из проекта «парсер» (не редактировать по мелочи,
   синхронизировать с оригиналом при изменениях). `account_source.py` — обёртка:
@@ -71,6 +75,18 @@ python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader
   сутки перед раскладкой) и в restore_and_schedule (при старте). Плюс кнопка
   «🔄 Обновить» в источнике (bot._refresh_source). Прогон парсера — в executor (блокирующий).
 - PARSE_LIMIT (env, 200) — сколько последних видео проверять за прогон.
+- `parser_youtube.py` — шортсы YouTube (из тестового скрипта проекта «adrian»). Пишет
+  в базу того же формата через `parser_tiktok.init_db/save_videos` (в `tt_video_id` —
+  id шортса, url = youtube.com/shorts/<id>). Вкладка Shorts длительность не отдаёт, а
+  запрос по каждому ролику ловит «Sign in to confirm you're not a bot» — длительность
+  берётся из плейлиста загрузок канала (UU…) в плоском режиме (`fill_durations`).
+  Её сбой парсинг не срывает: видео пишутся без длительности.
+- Из России YouTube заблокирован: `YOUTUBE_PROXY` (иначе `DOWNLOAD_PROXY`) — прокси для
+  парсинга и скачивания YouTube; `YOUTUBE_COOKIES` — путь к cookies.txt (скачивание
+  по одному ролику без кук часто упирается в проверку «не бот»). Без переменной куки
+  берутся из `data/youtube_cookies.txt` (`parser_youtube.cookies_path`), если файл есть;
+  `*cookies*.txt` и `data/` — в .gitignore;
+  `YOUTUBE_DURATION_SCAN` (1000) — сколько роликов плейлиста загрузок просматривать.
 
 ## Обработка видео (video_processor.py)
 - Режим хранится в `db.settings` (kv-таблица): `video_process_mode` (off/ultrafast/
@@ -90,4 +106,5 @@ python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader
 
 ## Не сделано
 - Лимит длительности в .env (сейчас захардкожен в downloader.py, как в исходном боте).
-- Парсер только TikTok (наследие исходного проекта).
+- Instagram как источник (без входа почти ничего не отдаёт, риск бана аккаунта).
+- Публикация в «Клипы» через shortVideo.* (проверена в «adrian», в бота не перенесена).

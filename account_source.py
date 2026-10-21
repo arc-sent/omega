@@ -1,8 +1,9 @@
-"""Источник-аккаунт: бот сам парсит TikTok-аккаунт в свою базу.
+"""Источник-аккаунт: бот сам парсит аккаунт в свою базу.
 
-Обёртка над parser_tiktok (перенесённый парсер): по нику/ссылке собирает ссылки
-на видео и складывает их в отдельную SQLite-базу этого источника (в data/sources/).
-Дальше правила читают эту базу так же, как внешнюю базу парсера.
+Платформа источника (sources.platform) выбирает парсер: 'tiktok' — parser_tiktok
+(перенесённый парсер), 'youtube' — parser_youtube (шортсы канала). Оба пишут в
+базу одного формата (таблица videos) — отдельную SQLite-базу источника в
+data/sources/. Дальше правила читают её так же, как внешнюю базу парсера.
 """
 
 import logging
@@ -11,6 +12,7 @@ import sqlite3
 
 import db
 import parser_tiktok as pt
+import parser_youtube as yt
 
 logger = logging.getLogger(__name__)
 
@@ -29,17 +31,34 @@ def source_db_path(source_id: int) -> str:
     return os.path.join(SOURCES_DIR, f"{source_id}.db")
 
 
-def normalize(account: str) -> tuple[str, str]:
+def normalize(account: str, platform: str = "tiktok") -> tuple[str, str]:
     """(username, profile_url) из ссылки/ника. Бросает ValueError при мусоре."""
+    if platform == "youtube":
+        return yt.normalize_channel(account)
     return pt.normalize_account(account)
 
 
-def _fetch(account: str, limit: int, start: int = 1) -> tuple[str, list, str]:
+def _fetch_youtube(account: str, limit: int, start: int = 1) -> tuple[str, list, str]:
+    """Шортсы канала окном [start, start+limit) + длительности из плейлиста загрузок."""
+    name, shorts_url = yt.normalize_channel(account)
+    entries, channel_id = yt.fetch_shorts(shorts_url, limit, start)
+    try:
+        yt.fill_durations(channel_id, entries)
+    except Exception:
+        # Длительность — бонус: без неё видео всё равно годятся (фильтр их не режет).
+        logger.warning("YouTube %s: не удалось узнать длительности", name, exc_info=True)
+    return name, entries, "yt-dlp"
+
+
+def _fetch(account: str, limit: int, start: int = 1,
+           platform: str = "tiktok") -> tuple[str, list, str]:
     """Собрать `limit` роликов начиная со `start`-го (1-based, новые→старые).
 
     start=1 — с самого свежего; start=20 — пропустить 19 свежих. Вернуть
     (username, entries, source).
     """
+    if platform == "youtube":
+        return _fetch_youtube(account, limit, start)
     username, profile_url = pt.normalize_account(account)
     is_username_form = profile_url.startswith("https://")
 
@@ -78,7 +97,7 @@ def count_videos(db_path: str) -> int:
 
 
 def refresh_account(account: str, db_path: str, limit: int = PARSE_LIMIT,
-                    start: int = 1) -> dict:
+                    start: int = 1, platform: str = "tiktok") -> dict:
     """Спарсить аккаунт и дописать новые видео в базу источника.
 
     start (1-based) — с какого ролика начинать (1 = с самого свежего). Позволяет
@@ -86,14 +105,15 @@ def refresh_account(account: str, db_path: str, limit: int = PARSE_LIMIT,
     {username, added, total, source}. Бросает исключения парсера, если ни
     yt-dlp, ни embed не смогли собрать видео.
     """
-    username, entries, source = _fetch(account, limit, start)
+    username, entries, source = _fetch(account, limit, start, platform)
     added = _save(username, db_path, entries)
-    logger.info("Парсинг @%s: старт %s, всего %s, новых %s (источник %s)",
-                username, start, len(entries), added, source)
+    logger.info("Парсинг %s @%s: старт %s, всего %s, новых %s (источник %s)",
+                platform, username, start, len(entries), added, source)
     return {"username": username, "added": added, "total": len(entries), "source": source}
 
 
-def deepen_account(account: str, db_path: str, step: int = PARSE_STEP) -> dict:
+def deepen_account(account: str, db_path: str, step: int = PARSE_STEP,
+                   platform: str = "tiktok") -> dict:
     """Углубиться в историю: запросить (текущее число + step) роликов от верха.
 
     Список TikTok идёт новыми→старыми, поэтому берём от верха окно шире того, что
@@ -105,7 +125,7 @@ def deepen_account(account: str, db_path: str, step: int = PARSE_STEP) -> dict:
     can_deepen (источник умеет уходить глубже — только yt-dlp, не embed).
     """
     limit = count_videos(db_path) + step
-    username, entries, source = _fetch(account, limit)
+    username, entries, source = _fetch(account, limit, platform=platform)
     added = _save(username, db_path, entries)
     exhausted = source == "yt-dlp" and len(entries) < limit
     logger.info("Углубление @%s: просили %s, получили %s, новых %s%s",

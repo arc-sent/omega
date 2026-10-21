@@ -384,6 +384,11 @@ def schedule_test_now(job_queue, rule_id: int) -> tuple[bool, str]:
 
 # ─── Джобы ────────────────────────────────────────────────────────────────────
 
+def _source_platform(source) -> str:
+    """Платформа источника-аккаунта; у баз до миграции колонки нет — это TikTok."""
+    return (source["platform"] if "platform" in source.keys() else None) or "tiktok"
+
+
 async def refresh_account_sources(context_or_app) -> int:
     """До-парсить все источники-аккаунты (собрать свежие ссылки в их базы).
 
@@ -400,16 +405,18 @@ async def refresh_account_sources(context_or_app) -> int:
     for s in sources:
         db_path = s["db_path"] or account_source.source_db_path(s["id"])
         start = s["parse_start"] if "parse_start" in s.keys() else 1
+        platform = _source_platform(s)
         try:
             res = await loop.run_in_executor(
                 None, account_source.refresh_account, s["account"], db_path,
-                account_source.PARSE_LIMIT, start,
+                account_source.PARSE_LIMIT, start, platform,
             )
             refreshed += 1
-            logger.info("Источник %s (@%s): +%s новых", s["id"], res["username"], res["added"])
+            logger.info("Источник %s (%s @%s): +%s новых",
+                        s["id"], platform, res["username"], res["added"])
         except Exception as exc:
             logger.exception("Не удалось спарсить источник %s (%s)", s["id"], s["account"])
-            _record_error(s["telegram_id"], exc, stage="парсинг аккаунта", platform="tiktok")
+            _record_error(s["telegram_id"], exc, stage="парсинг аккаунта", platform=platform)
     return refreshed
 
 
@@ -477,13 +484,14 @@ async def ensure_backlog(context_or_app) -> int:
                 break  # запаса хватает
             try:
                 res = await loop.run_in_executor(
-                    None, account_source.deepen_account, src["account"], db_path
+                    None, account_source.deepen_account, src["account"], db_path,
+                    account_source.PARSE_STEP, _source_platform(src),
                 )
             except Exception as exc:
                 logger.exception("Не удалось углубить источник %s (%s)",
                                  src["id"], src["account"])
                 _record_error(src["telegram_id"], exc,
-                              stage="допарсинг истории", platform="tiktok")
+                              stage="допарсинг истории", platform=_source_platform(src))
                 break
             deepened += 1
             logger.info("Источник %s (@%s): углубление +%s новых (запас был %s/%s)",

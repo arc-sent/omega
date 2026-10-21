@@ -5,7 +5,8 @@
     users            — телеграм-пользователь
     vk_accounts      — VK-аккаунты (токены) пользователя; один пользователь — много аккаунтов
     vk_groups        — целевые VK-группы; каждая привязана к одному аккаунту
-    sources          — источники видео (путь к БД парсера + фильтр по нику)
+    sources          — источники видео (путь к БД парсера + фильтр по нику; у источников-
+                       аккаунтов platform = tiktok/youtube — какой парсер их ведёт)
     rules            — правило = пара (источник → группа) + настройки публикации
     published        — что уже опубликовано по каждому правилу (дедуп)
     scheduled_posts  — запланированные публикации (переживают рестарт бота)
@@ -73,6 +74,7 @@ def init_db() -> None:
                 account_id    INTEGER,
                 backfill_done INTEGER NOT NULL DEFAULT 0,
                 parse_start   INTEGER NOT NULL DEFAULT 1,
+                platform      TEXT NOT NULL DEFAULT 'tiktok',
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
                 FOREIGN KEY (account_id)  REFERENCES vk_accounts(id)   ON DELETE SET NULL
             );
@@ -205,6 +207,12 @@ def init_db() -> None:
             conn.execute("DROP TABLE sources")
             conn.execute("ALTER TABLE sources_new RENAME TO sources")
             conn.execute("PRAGMA foreign_keys = ON")
+
+        # Платформа источника-аккаунта (tiktok/youtube). Все старые — TikTok.
+        # Идёт после пересборки sources: та копирует только известные ей колонки.
+        src_cols = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
+        if "platform" not in src_cols:
+            conn.execute("ALTER TABLE sources ADD COLUMN platform TEXT NOT NULL DEFAULT 'tiktok'")
 
         grp_cols = {row[1] for row in conn.execute("PRAGMA table_info(vk_groups)")}
         if "account_id" not in grp_cols:
@@ -441,13 +449,15 @@ def get_source(source_id: int) -> sqlite3.Row | None:
 def add_source(
     telegram_id: int, name: str, db_path: str, username: str | None,
     *, kind: str = "db", account: str | None = None, account_id: int | None = None,
+    platform: str = "tiktok",
 ) -> int:
+    """platform — только для kind='account': 'tiktok' или 'youtube'."""
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO sources "
-            "(telegram_id, name, db_path, username, kind, account, account_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (telegram_id, name, db_path, username, kind, account, account_id),
+            "(telegram_id, name, db_path, username, kind, account, account_id, platform) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (telegram_id, name, db_path, username, kind, account, account_id, platform),
         )
         return cur.lastrowid
 

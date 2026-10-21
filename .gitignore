@@ -3,6 +3,7 @@
 .env.example
 token.key
 *.key
+*cookies*.txt
 
 # Данные бота (база, состояние, временные видео)
 data/

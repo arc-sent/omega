@@ -89,6 +89,14 @@ def detect_platform(url: str) -> str | None:
 
 # ─── Универсальный загрузчик через yt-dlp (TikTok, YouTube Shorts) ────────────
 
+def _youtube_cookies() -> str | None:
+    """cookies.txt для YouTube: при скачивании по одному ролику он часто требует
+    «Sign in to confirm you're not a bot», и без кук это не обойти.
+    YOUTUBE_COOKIES, иначе data/youtube_cookies.txt (см. parser_youtube)."""
+    from parser_youtube import cookies_path
+    return cookies_path()
+
+
 def _download_ytdlp_sync(
     url: str,
     save_path: str | None,
@@ -97,9 +105,16 @@ def _download_ytdlp_sync(
     proxy: str | None = None,
 ) -> tuple[str, str]:
     _proxy = proxy or DOWNLOAD_PROXY
+    cookies = None
+    if prefix == "youtube":
+        # Из России YouTube заблокирован — свой прокси приоритетнее общего.
+        _proxy = proxy or os.getenv("YOUTUBE_PROXY") or DOWNLOAD_PROXY
+        cookies = _youtube_cookies()
     meta_opts: dict = {"quiet": True, "no_warnings": True}
     if _proxy:
         meta_opts["proxy"] = _proxy
+    if cookies:
+        meta_opts["cookiefile"] = cookies
 
     # Фаза 1: получаем метаданные без скачивания — проверяем длительность
     with yt_dlp.YoutubeDL(meta_opts) as ydl:
@@ -125,6 +140,8 @@ def _download_ytdlp_sync(
     }
     if _proxy:
         ydl_opts["proxy"] = _proxy
+    if cookies:
+        ydl_opts["cookiefile"] = cookies
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         expected = ydl.prepare_filename(info)
