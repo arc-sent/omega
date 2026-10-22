@@ -21,9 +21,19 @@ logger = logging.getLogger(__name__)
 
 MAX_VIDEO_DURATION = 180  # секунд (3 минуты)
 
-# Полноценные ролики YouTube (не шортсы): свой лимит длительности и потолок
-# качества — каждый ролик идёт через прокси, а сервер слабый.
-YOUTUBE_VIDEO_MAX_DURATION = int(os.getenv("YOUTUBE_VIDEO_MAX_DURATION", "1200"))
+def _env_limit(name: str) -> int | None:
+    """Лимит в секундах из env; не задан, пуст, 0 или мусор — None (без лимита)."""
+    try:
+        value = int(os.getenv(name, "").strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+# Полноценные ролики YouTube (не шортсы): лимит длительности — только если задан
+# в env (по умолчанию без ограничения), и потолок качества — каждый ролик идёт
+# через прокси, а сервер слабый.
+YOUTUBE_VIDEO_MAX_DURATION: int | None = _env_limit("YOUTUBE_VIDEO_MAX_DURATION")
 YOUTUBE_VIDEO_MAX_HEIGHT = int(os.getenv("YOUTUBE_VIDEO_MAX_HEIGHT", "1080"))
 
 # Прокси для скачивания видео (все платформы). Формат: http://user:pass@host:port
@@ -209,7 +219,8 @@ async def download_youtube(url: str, save_path: str | None = None) -> tuple[str,
     """Скачивает YouTube Shorts (и обычные видео) через yt-dlp.
 
     Шортсы — лимит MAX_VIDEO_DURATION и H.264 для «Клипов»; полноценные ролики
-    (watch-ссылки) — лимит YOUTUBE_VIDEO_MAX_DURATION, без перекодирования.
+    (watch-ссылки) — без перекодирования и без лимита длительности, если не задан
+    YOUTUBE_VIDEO_MAX_DURATION.
 
     Возвращает (путь к файлу, название)."""
     loop = asyncio.get_running_loop()
@@ -311,9 +322,9 @@ def _find_duration(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _check_duration(duration: int | None, limit: int = MAX_VIDEO_DURATION) -> None:
-    """Бросает ValueError если длительность превышает лимит (секунды)."""
-    if duration and duration > limit:
+def _check_duration(duration: int | None, limit: int | None = MAX_VIDEO_DURATION) -> None:
+    """Бросает ValueError если длительность превышает лимит (секунды; None — без лимита)."""
+    if limit and duration and duration > limit:
         mins, secs = divmod(int(duration), 60)
         lim_m, lim_s = divmod(int(limit), 60)
         limit_text = f"{lim_m} мин" if not lim_s else f"{lim_m}:{lim_s:02d}"

@@ -124,6 +124,46 @@ def fetch_group_name(vk_token: str, group_id: int) -> str | None:
     return None
 
 
+# groups.getById принимает до 500 id за вызов.
+_GROUPS_BATCH = 500
+
+
+def fetch_groups_members(vk_token: str, group_ids: list[int]) -> dict[int, tuple[int | None, str]]:
+    """Число подписчиков групп: {group_id: (members_count, name)}.
+
+    members_count = None, если VK его не отдал (закрытая/заблокированная группа).
+    Группы, которых нет в ответе, в результат не попадают. Бросает VKError при
+    ошибке API — вызывающий решает, пробовать ли другой токен.
+    """
+    result: dict[int, tuple[int | None, str]] = {}
+    ids = [abs(int(g)) for g in group_ids]
+    for i in range(0, len(ids), _GROUPS_BATCH):
+        chunk = ids[i:i + _GROUPS_BATCH]
+        try:
+            # POST с телом, а не GET с params: при сетевой ошибке requests кладёт
+            # URL с query-строкой в текст исключения, и токен утёк бы в логи.
+            resp = requests.post(
+                "https://api.vk.com/method/groups.getById",
+                data={"access_token": vk_token, "v": VK_API_VERSION,
+                      "group_ids": ",".join(map(str, chunk)), "fields": "members_count"},
+                timeout=20,
+            ).json()
+        except Exception as exc:
+            raise VKError(None, f"groups.getById: {exc}", stage="метрика", network=True) from exc
+        if "error" in resp:
+            err = resp["error"]
+            raise VKError(err.get("error_code"), err.get("error_msg", "groups.getById"),
+                          stage="метрика")
+        response = resp.get("response")
+        groups = response.get("groups", []) if isinstance(response, dict) else (response or [])
+        for g in groups:
+            try:
+                result[int(g["id"])] = (g.get("members_count"), g.get("name") or "")
+            except (KeyError, TypeError, ValueError):
+                continue
+    return result
+
+
 # ─── Публикация ───────────────────────────────────────────────────────────────
 
 def upload_to_vk(

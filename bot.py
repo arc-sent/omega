@@ -8,9 +8,10 @@
 import os
 import re
 import asyncio
+import time
 import logging
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
 import pytz
 import matplotlib
@@ -29,6 +30,7 @@ import db
 import scheduler
 import account_source
 import video_processor
+import metrics
 from vk import resolve_screen_name, fetch_group_name
 from source_reader import check_source, fetch_candidates, SourceError
 
@@ -40,6 +42,9 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split("
 ERROR_RETENTION_DAYS = int(os.getenv("ERROR_RETENTION_DAYS", "5"))
 ERROR_CLEANUP_INTERVAL_DAYS = int(os.getenv("ERROR_CLEANUP_INTERVAL_DAYS", "5"))
 ERRORS_PAGE_SIZE = 8
+# Ежедневный снимок подписчиков всех групп (МСК) — из него строится история роста.
+METRICS_HOUR = int(os.getenv("METRICS_HOUR", "23"))
+METRICS_MINUTE = int(os.getenv("METRICS_MINUTE", "50"))
 GROUPS_PAGE_SIZE = 15
 
 logging.basicConfig(
@@ -64,16 +69,17 @@ BTN_STATUS = "📊 Статус"
 BTN_STATS = "📈 Статистика"
 BTN_TEMPLATES = "📝 Описания"
 BTN_PROCESS = "⚙️ Обработка"
+BTN_METRICS = "📊 Метрика"
 MENU_BUTTON_TEXTS = [BTN_ACCOUNTS, BTN_GROUPS, BTN_SOURCES, BTN_RULES, BTN_STATUS,
-                     BTN_STATS, BTN_TEMPLATES, BTN_PROCESS]
+                     BTN_STATS, BTN_TEMPLATES, BTN_PROCESS, BTN_METRICS]
 
 
 def main_keyboard(telegram_id: int | None = None) -> ReplyKeyboardMarkup:
-    """Постоянное меню. «Обработка» — только владельцу (ADMIN_IDS)."""
+    """Постоянное меню. «Обработка» и «Метрика» — только владельцу (ADMIN_IDS)."""
     rows = [[BTN_ACCOUNTS, BTN_GROUPS], [BTN_SOURCES, BTN_RULES],
             [BTN_STATUS, BTN_STATS], [BTN_TEMPLATES]]
     if telegram_id is not None and _is_admin(telegram_id):
-        rows.append([BTN_PROCESS])
+        rows.append([BTN_PROCESS, BTN_METRICS])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -140,6 +146,8 @@ async def main_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     elif text == BTN_PROCESS:
         await cmd_process(update, context)
+    elif text == BTN_METRICS:
+        await cmd_metrics(update, context)
 
 
 # ─── Аккаунты VK (токены) ─────────────────────────────────────────────────────
@@ -736,8 +744,8 @@ async def sources_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "Пришли ссылку или @handle YouTube-канала — бот будет брать его обычные "
             "ролики (вкладка «Видео»), не шортсы.\n"
             "Например: https://www.youtube.com/@smexoshorts или @smexoshorts\n\n"
-            "Публикуются обычным видео VK. Ролики длиннее лимита "
-            "(YOUTUBE_VIDEO_MAX_DURATION, по умолчанию 20 мин) не скачиваются."
+            "Публикуются обычным видео VK. Длительность не ограничена — лимит "
+            "включается только переменной YOUTUBE_VIDEO_MAX_DURATION (секунды)."
         )
         return SRC_ACCOUNT
     if query.data == "src_type_youtube":
@@ -1703,6 +1711,108 @@ async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Очистка логов ошибок: удалено %s записей", deleted)
 
 
+# ─── Метрика групп (только админ) ─────────────────────────────────────────────
+
+def _metrics_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📈 График {d} дн", callback_data=f"met_chart_{d}")
+         for d in metrics.CHART_PERIODS],
+        [InlineKeyboardButton("🔄 Обновить (PDF)", callback_data="met_refresh"),
+         InlineKeyboardButton("📝 Текстом", callback_data="met_text")],
+    ])
+
+
+async def _send_metrics_report(message, *, refresh: bool) -> None:
+    """Снять свежий снимок (если refresh) и прислать PDF-отчёт по всем группам."""
+    loop = asyncio.get_running_loop()
+    note = ""
+    wait = await message.reply_text(
+        "⏳ Снимаю подписчиков всех групп и собираю PDF…" if refresh else "⏳ Собираю PDF…"
+    )
+    try:
+        if refresh:
+            res = await loop.run_in_executor(None, metrics.collect_snapshot)
+            note = f"Снято: {res['saved']} из {res['total']}."
+        now = int(time.time())
+        data = await loop.run_in_executor(None, metrics.report_data, now)
+        pdf = await loop.run_in_executor(None, metrics.build_pdf, now)
+    finally:
+        await wait.delete()
+    if pdf is None:
+        await message.reply_text("Пока ни у одного пользователя нет групп.")
+        return
+    head = metrics.summary_lines(data)
+    caption = "\n".join(["📊 " + head[0], *head[1:], *([note] if note else [])])
+    await message.reply_document(
+        document=BytesIO(pdf), filename=metrics.pdf_filename(now),
+        caption=caption[:1024], reply_markup=_metrics_kb(),
+    )
+
+
+async def _send_metrics_text(message) -> None:
+    """Тот же отчёт текстом (без нового снимка)."""
+    loop = asyncio.get_running_loop()
+    lines = await loop.run_in_executor(None, metrics.build_report)
+    for part in metrics.split_messages(lines):
+        await message.reply_text(part)
+
+
+async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/metrics — свежий снимок + PDF-отчёт; /metrics <id группы> — график одной группы."""
+    if not _is_admin(update.effective_user.id):
+        return
+    if context.args:
+        try:
+            gid = abs(int(context.args[0]))
+        except ValueError:
+            await update.message.reply_text("Формат: /metrics или /metrics <id группы VK>")
+            return
+        days = 30
+        if len(context.args) > 1 and context.args[1].isdigit():
+            days = max(2, min(int(context.args[1]), 365))
+        loop = asyncio.get_running_loop()
+        chart = await loop.run_in_executor(None, metrics.build_chart, days, None, gid)
+        if chart is None:
+            await update.message.reply_text("Мало данных для графика этой группы (нужно ≥ 2 дней снимков).")
+            return
+        await update.message.reply_photo(photo=BytesIO(chart), caption=f"📈 Группа {gid} · {days} дн")
+        return
+    await _send_metrics_report(update.message, refresh=True)
+
+
+async def metrics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_admin(query.from_user.id):
+        await query.answer()
+        return
+    if query.data == "met_refresh":
+        await query.answer("Обновляю…")
+        await _send_metrics_report(query.message, refresh=True)
+        return
+    if query.data == "met_text":
+        await query.answer()
+        await _send_metrics_text(query.message)
+        return
+    days = int(query.data.rsplit("_", 1)[1])
+    await query.answer()
+    loop = asyncio.get_running_loop()
+    chart = await loop.run_in_executor(None, metrics.build_chart, days)
+    if chart is None:
+        await query.message.reply_text(
+            "Мало данных для графика: снимки копятся раз в сутки, нужно хотя бы 2 дня."
+        )
+        return
+    await query.message.reply_photo(photo=BytesIO(chart), caption=f"📈 Все группы · {days} дн")
+
+
+async def _metrics_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, metrics.collect_snapshot)
+    except Exception:
+        logger.exception("Не удалось снять метрику групп")
+
+
 # ─── /stop, /startBot — глобальная пауза публикации ───────────────────────────
 
 async def cmd_stop_publishing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1837,6 +1947,8 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", cmd_stop_publishing))
     app.add_handler(CommandHandler("startBot", cmd_start_publishing))
     app.add_handler(CommandHandler("process", cmd_process))
+    app.add_handler(CommandHandler("metrics", cmd_metrics))
+    app.add_handler(CallbackQueryHandler(metrics_callback, pattern=r"^met_(refresh|text|chart_\d+)$"))
     app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats_period_"))
     app.add_handler(CallbackQueryHandler(stats_chart_callback, pattern=r"^stats_chart_"))
     app.add_handler(CallbackQueryHandler(errors_callback, pattern=r"^err_"))
@@ -1858,6 +1970,17 @@ def main() -> None:
         _cleanup_errors_job, interval=timedelta(days=ERROR_CLEANUP_INTERVAL_DAYS),
         first=timedelta(minutes=1), name="cleanup_errors",
     )
+    app.job_queue.run_daily(
+        _metrics_snapshot_job,
+        time=dtime(hour=METRICS_HOUR, minute=METRICS_MINUTE, tzinfo=MOSCOW_TZ),
+        name="metrics_snapshot",
+    )
+    # Точка отсчёта роста: если свежего снимка нет (первый запуск или бот долго
+    # лежал) — снять его вскоре после старта, не дожидаясь вечера.
+    age = metrics.last_snapshot_age()
+    if age is None or age > 20 * 3600:
+        app.job_queue.run_once(_metrics_snapshot_job, when=timedelta(minutes=2),
+                               name="metrics_snapshot_start")
 
     if not ADMIN_IDS:
         logger.warning("ADMIN_IDS пуст — раздел «Обработка видео» (/process) никому не доступен")

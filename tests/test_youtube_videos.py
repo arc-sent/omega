@@ -189,3 +189,41 @@ def test_shorts_keep_3_min_limit_and_h264(fake_download):
         "https://www.youtube.com/shorts/vid", fake_download["dir"], "youtube", "YouTube Video")
     assert len(fake_download["ensure_calls"]) == 1
     assert "avc1" not in FakeDownloadYDL.download_opts["format"]
+
+
+# ─── Лимит только из env ──────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, None), ("", None), ("0", None), ("-5", None), ("мусор", None),
+    ("1800", 1800), (" 600 ", 600),
+])
+def test_env_limit(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("YOUTUBE_VIDEO_MAX_DURATION", raising=False)
+    else:
+        monkeypatch.setenv("YOUTUBE_VIDEO_MAX_DURATION", raw)
+    assert downloader._env_limit("YOUTUBE_VIDEO_MAX_DURATION") == expected
+
+
+def test_no_limit_downloads_any_length(fake_download, monkeypatch):
+    monkeypatch.setattr(downloader, "YOUTUBE_VIDEO_MAX_DURATION", None)
+    FakeDownloadYDL.duration = 3 * 3600
+    path, _ = downloader._download_ytdlp_sync(
+        "https://www.youtube.com/watch?v=vid", fake_download["dir"], "youtube", "YouTube Video")
+    assert os.path.isfile(path)
+
+
+def test_no_limit_keeps_all_in_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(yt, "YoutubeDL", FakeTabYDL)
+    monkeypatch.setattr(downloader, "YOUTUBE_VIDEO_MAX_DURATION", None)
+    res = account_source.refresh_account("@smexoshorts", str(tmp_path / "ytv.db"),
+                                         platform="youtube_videos")
+    assert res["too_long"] == 0 and res["added"] == res["total"]
+
+
+def test_shorts_limit_stays_3_min_without_env(fake_download, monkeypatch):
+    monkeypatch.setattr(downloader, "YOUTUBE_VIDEO_MAX_DURATION", None)
+    FakeDownloadYDL.duration = 900
+    with pytest.raises(ValueError, match="Максимум 3 мин"):
+        downloader._download_ytdlp_sync(
+            "https://www.youtube.com/shorts/vid", fake_download["dir"], "youtube", "YouTube Video")

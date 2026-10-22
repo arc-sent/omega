@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
-      - ADMIN_IDS=${ADMIN_IDS}
+      - ADMIN_IDS=${ADMIN_IDS:-968500846}
       # Ключ шифрования VK-токенов. Если задан — используется вместо data/token.key.
       # Менять после того, как токены уже зашифрованы, нельзя (расшифровка сломается).
       - TOKEN_KEY=${TOKEN_KEY:-}
@@ -20,9 +20,13 @@ services:
       # YouTube-источники. Из России YouTube заблокирован — нужен зарубежный прокси.
       # Куки кладутся в ./data/youtube_cookies.txt и подхватываются сами.
       - YOUTUBE_PROXY=${YOUTUBE_PROXY:-}
-      # Полноценные ролики YouTube (не шортсы): лимит длительности, сек, и потолок качества.
-      - YOUTUBE_VIDEO_MAX_DURATION=${YOUTUBE_VIDEO_MAX_DURATION:-1200}
+      # Полноценные ролики YouTube (не шортсы): лимит длительности, сек (пусто или 0 —
+      # без лимита), и потолок качества.
+      - YOUTUBE_VIDEO_MAX_DURATION=${YOUTUBE_VIDEO_MAX_DURATION:-}
       - YOUTUBE_VIDEO_MAX_HEIGHT=${YOUTUBE_VIDEO_MAX_HEIGHT:-1080}
+      # Ежедневный снимок подписчиков всех групп для /metrics (МСК).
+      - METRICS_HOUR=${METRICS_HOUR:-23}
+      - METRICS_MINUTE=${METRICS_MINUTE:-50}
     volumes:
       - ./data:/app/data
       # Базы парсера должны быть доступны боту по тем же путям, что указаны в

@@ -13,6 +13,7 @@
     scheduled_posts  — запланированные публикации (переживают рестарт бота)
     settings         — глобальные настройки бота (ключ→значение), переживают рестарт
     error_logs       — журнал ошибок для /errors и админ-панели
+    group_metrics    — снимки числа подписчиков VK-групп (/metrics, история роста)
 """
 
 import os
@@ -156,6 +157,19 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_error_logs_user
                 ON error_logs (telegram_id, created_at DESC);
+
+            -- Снимки по vk_group_id, а не по строке vk_groups: история переживает
+            -- удаление/повторное добавление группы и не дублируется у разных юзеров.
+            CREATE TABLE IF NOT EXISTS group_metrics (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                vk_group_id   INTEGER NOT NULL,
+                captured_at   INTEGER NOT NULL,
+                members_count INTEGER NOT NULL,
+                name          TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_group_metrics_group
+                ON group_metrics (vk_group_id, captured_at);
             """
         )
 
@@ -878,3 +892,78 @@ def cleanup_old_errors(days: int) -> int:
     with _connect() as conn:
         cur = conn.execute("DELETE FROM error_logs WHERE created_at < ?", (cutoff,))
         return cur.rowcount
+
+
+# ─── Метрика групп (подписчики) ───────────────────────────────────────────────
+
+def get_all_groups_for_metrics() -> list[sqlite3.Row]:
+    """Все группы всех пользователей: vk_group_id, имя, владелец и его аккаунт.
+
+    Одна VK-группа может быть у нескольких пользователей — дедуп делает вызывающий.
+    """
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT g.vk_group_id, g.name, g.telegram_id, g.account_id
+            FROM vk_groups g
+            ORDER BY g.vk_group_id, g.id
+            """
+        ).fetchall()
+
+
+def add_group_metrics(rows: list[tuple[int, int, str | None]], captured_at: int | None = None) -> None:
+    """Записать снимок: rows = [(vk_group_id, members_count, name), ...]."""
+    ts = int(captured_at if captured_at is not None else time.time())
+    with _connect() as conn:
+        conn.executemany(
+            "INSERT INTO group_metrics (vk_group_id, captured_at, members_count, name) "
+            "VALUES (?, ?, ?, ?)",
+            [(gid, ts, cnt, name) for gid, cnt, name in rows],
+        )
+
+
+def get_group_metrics(vk_group_id: int, since_ts: int = 0) -> list[sqlite3.Row]:
+    """Снимки группы с since_ts, по возрастанию времени."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT captured_at, members_count FROM group_metrics "
+            "WHERE vk_group_id = ? AND captured_at >= ? ORDER BY captured_at",
+            (vk_group_id, since_ts),
+        ).fetchall()
+
+
+def get_latest_metric_before(vk_group_id: int, ts: int) -> sqlite3.Row | None:
+    """Последний снимок группы не позже ts."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT captured_at, members_count FROM group_metrics "
+            "WHERE vk_group_id = ? AND captured_at <= ? "
+            "ORDER BY captured_at DESC LIMIT 1",
+            (vk_group_id, ts),
+        ).fetchone()
+
+
+def get_first_metric(vk_group_id: int) -> sqlite3.Row | None:
+    """Самый первый снимок группы (начало отслеживания)."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT captured_at, members_count FROM group_metrics "
+            "WHERE vk_group_id = ? ORDER BY captured_at LIMIT 1",
+            (vk_group_id,),
+        ).fetchone()
+
+
+def count_published_to_vk_group(vk_group_id: int, start_ts: int, end_ts: int) -> int:
+    """Сколько роликов ушло в VK-группу за период (по всем правилам и юзерам)."""
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM published p
+            JOIN rules r     ON r.id = p.rule_id
+            JOIN vk_groups g ON g.id = r.group_id
+            WHERE g.vk_group_id = ? AND p.published_at >= ? AND p.published_at < ?
+            """,
+            (vk_group_id, start_ts, end_ts),
+        ).fetchone()
+    return row["c"] if row else 0

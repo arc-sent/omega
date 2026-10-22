@@ -83,15 +83,16 @@ def _fetch(account: str, limit: int, start: int = 1,
 def _drop_too_long(entries: list, platform: str) -> tuple[list, int]:
     """Для полноценных роликов YouTube — не пускать в базу то, что не скачается.
 
-    Ролик длиннее YOUTUBE_VIDEO_MAX_DURATION downloader отвергнет, а упавший пост
+    Работает, только если YOUTUBE_VIDEO_MAX_DURATION задан в env (по умолчанию
+    лимита нет). Ролик длиннее лимита downloader отвергнет, а упавший пост
     не попадает в published — правило брало бы его снова каждый день. Поэтому
     такие ролики в базу источника не пишем; поднимут лимит — ближайший до-парсинг
     их добавит. Неизвестная длительность не отбрасывается (как и в фильтре правил).
     Возвращает (что сохранять, сколько отброшено).
     """
-    if platform != "youtube_videos":
-        return entries, 0
     from downloader import YOUTUBE_VIDEO_MAX_DURATION as limit
+    if platform != "youtube_videos" or not limit:
+        return entries, 0  # лимит не задан в env — длительность не ограничена
     kept = [e for e in entries if e.get("duration") is None or e["duration"] <= limit]
     return kept, len(entries) - len(kept)
 
