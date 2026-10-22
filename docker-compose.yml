@@ -17,6 +17,9 @@ services:
       - DAILY_PLAN_MINUTE=${DAILY_PLAN_MINUTE:-5}
       - ERROR_RETENTION_DAYS=${ERROR_RETENTION_DAYS:-5}
       - ERROR_CLEANUP_INTERVAL_DAYS=${ERROR_CLEANUP_INTERVAL_DAYS:-5}
+      # YouTube-источники. Из России YouTube заблокирован — нужен зарубежный прокси.
+      # Куки кладутся в ./data/youtube_cookies.txt и подхватываются сами.
+      - YOUTUBE_PROXY=${YOUTUBE_PROXY:-}
     volumes:
       - ./data:/app/data
       # Базы парсера должны быть доступны боту по тем же путям, что указаны в

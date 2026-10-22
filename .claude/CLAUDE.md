@@ -53,6 +53,15 @@ Telegram-бот, который автоматически публикует в
   MAX_VIDEO_DURATION=180, ослабленный SSL для VK CDN — осознанный компромисс).
 - `vk.upload_to_vk` и резолв групп — портированы оттуда же.
 
+## Деплой (Docker)
+- На сервере бот работает в Docker (`docker-compose.yml`, код в /app, данные — volume
+  ./data → /app/data). **`Dockerfile` копирует модули поимённо**: новый .py-модуль
+  обязательно добавить в `COPY`, иначе контейнер падает с ModuleNotFoundError.
+- В контейнер попадают только переменные, перечисленные в `environment` compose-файла
+  (env_file нет) — новую переменную окружения добавлять туда же.
+- yt-dlp ставится при сборке образа; обновить его — пересобрать без кэша
+  (`docker compose build --no-cache`), `pip install` на хосте контейнер не видит.
+
 ## Проверка после изменений
 ```bash
 python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader.py account_source.py parser_youtube.py
