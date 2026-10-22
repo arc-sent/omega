@@ -74,7 +74,8 @@ python -m pytest -q
 ## Источники-аккаунты (парсер встроен — Фаза 3 сделана)
 - `sources.kind` = 'db' (внешний путь) | 'account' (бот парсит сам).
 - `sources.platform` = 'tiktok' (по умолчанию, все старые источники) | 'youtube'
-  (шортсы канала) — какой парсер ведёт account-источник. Платформа прокидывается в
+  (шортсы канала) | 'youtube_videos' (полноценные ролики канала, вкладка «Видео») —
+  какой парсер ведёт account-источник. Платформа прокидывается в
   refresh_account/deepen_account из scheduler и bot (`_source_platform`).
 - Для account: `sources.account` = ник, `db_path` = data/sources/<id>.db (ведёт бот).
 - `parser_tiktok.py` — копия парсера из проекта «парсер» (не редактировать по мелочи,
@@ -96,6 +97,16 @@ python -m pytest -q
   берутся из `data/youtube_cookies.txt` (`parser_youtube.cookies_path`), если файл есть;
   `*cookies*.txt` и `data/` — в .gitignore;
   `YOUTUBE_DURATION_SCAN` (1000) — сколько роликов плейлиста загрузок просматривать.
+- **Полноценные ролики YouTube** (`youtube_videos`, «попробовать»): пишутся ссылками
+  `watch?v=<id>`, шортсы — `shorts/<id>`; по форме ссылки `downloader.is_youtube_long_video`
+  выбирает режим. Длинный ролик: лимит `YOUTUBE_VIDEO_MAX_DURATION` (1200 с) вместо
+  180, формат — сразу H.264 не выше `YOUTUBE_VIDEO_MAX_HEIGHT` (1080), `_ensure_h264`
+  НЕ вызывается (H.264 нужен только «Клипам», а перекод минут 1080p на 1 ядре — часы).
+  Публикуется обычным видео (`upload_to_vk`). Обработка видео их пропускает (>60 с).
+- Ролики длиннее лимита **не пишутся в базу источника** (`account_source._drop_too_long`):
+  упавший на скачивании пост не попадает в published, и правило брало бы его каждый
+  день. Поднимут лимит — до-парсинг их добавит. В deepen `exhausted` считается по
+  полученным, а не сохранённым роликам.
 
 ## Обработка видео (video_processor.py)
 - Режим хранится в `db.settings` (kv-таблица): `video_process_mode` (off/ultrafast/

@@ -568,6 +568,17 @@ async def groups_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 # ─── Источники ────────────────────────────────────────────────────────────────
 
+def _too_long_note(res: dict) -> str:
+    """Пометка, сколько полноценных роликов YouTube не взято из-за лимита длительности."""
+    n = res.get("too_long") or 0
+    return (f"\n⏭ Пропущено длиннее лимита (YOUTUBE_VIDEO_MAX_DURATION): {n}."
+            if n else "")
+
+
+# Значок источника-аккаунта по платформе.
+SOURCE_ICONS = {"tiktok": "🎵", "youtube": "▶️", "youtube_videos": "📺"}
+
+
 def _source_platform(s) -> str:
     """Платформа источника-аккаунта (tiktok/youtube); до миграции колонки нет — TikTok."""
     return (s["platform"] if "platform" in s.keys() else None) or "tiktok"
@@ -577,7 +588,7 @@ def sources_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboar
     rows = []
     for s in db.get_sources(telegram_id, for_account_id=account_id):
         if s["kind"] == "account":
-            icon = "▶️" if _source_platform(s) == "youtube" else "🎵"
+            icon = SOURCE_ICONS.get(_source_platform(s), "🎵")
             label = f"{icon} {s['name']} (@{s['account']})"
         else:
             label = f"🗄 {s['name']}" + (f" · @{s['username']}" if s["username"] else "")
@@ -696,6 +707,7 @@ async def _refresh_source(query, source_id: int, account_id: int | None = None) 
             account_source.PARSE_LIMIT, start, _source_platform(s),
         )
         note = f"✅ @{res['username']}: всего {res['total']}, новых {res['added']} (старт {start})."
+        note += _too_long_note(res)
     except Exception as exc:
         note = f"❌ Не удалось спарсить @{s['account']}:\n{exc}"
     await query.message.reply_text(note)
@@ -707,6 +719,8 @@ async def sources_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎵 TikTok-аккаунт (бот парсит сам)", callback_data="src_type_account")],
         [InlineKeyboardButton("▶️ YouTube-канал, шортсы (бот парсит сам)", callback_data="src_type_youtube")],
+        [InlineKeyboardButton("📺 YouTube-канал, обычные видео (бот парсит сам)",
+                              callback_data="src_type_ytvideos")],
         [InlineKeyboardButton("🗄 Готовая база парсера (файл .db)", callback_data="src_type_db")],
     ])
     await update.message.reply_text("Какой это источник?", reply_markup=kb)
@@ -716,6 +730,16 @@ async def sources_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def sources_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    if query.data == "src_type_ytvideos":
+        context.user_data["src_platform"] = "youtube_videos"
+        await query.edit_message_text(
+            "Пришли ссылку или @handle YouTube-канала — бот будет брать его обычные "
+            "ролики (вкладка «Видео»), не шортсы.\n"
+            "Например: https://www.youtube.com/@smexoshorts или @smexoshorts\n\n"
+            "Публикуются обычным видео VK. Ролики длиннее лимита "
+            "(YOUTUBE_VIDEO_MAX_DURATION, по умолчанию 20 мин) не скачиваются."
+        )
+        return SRC_ACCOUNT
     if query.data == "src_type_youtube":
         context.user_data["src_platform"] = "youtube"
         await query.edit_message_text(
@@ -762,6 +786,7 @@ async def sources_account(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             account_source.PARSE_LIMIT, 1, platform,
         )
         note = f"✅ Источник добавлен. Собрано ссылок: {res['total']} (новых {res['added']})."
+        note += _too_long_note(res)
     except Exception as exc:
         note = (f"⚠️ Источник добавлен, но первый парсинг не удался:\n{exc}\n"
                 "Можно повторить кнопкой «🔄 Обновить».")
@@ -1763,7 +1788,7 @@ def main() -> None:
         ],
         states={
             SRC_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_name)],
-            SRC_TYPE:    [CallbackQueryHandler(sources_type, pattern=r"^src_type_(account|youtube|db)$")],
+            SRC_TYPE:    [CallbackQueryHandler(sources_type, pattern=r"^src_type_(account|youtube|ytvideos|db)$")],
             SRC_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_account)],
             SRC_PATH:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_path)],
             SRC_USER:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_user)],

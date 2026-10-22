@@ -108,7 +108,8 @@ def fake_ytdlp(monkeypatch):
 def test_refresh_youtube_account_writes_source_db(tmp_path, fake_ytdlp):
     path = str(tmp_path / "yt.db")
     res = account_source.refresh_account("@smexoshorts", path, platform="youtube")
-    assert res == {"username": "smexoshorts", "added": 3, "total": 3, "source": "yt-dlp"}
+    assert res == {"username": "smexoshorts", "added": 3, "total": 3, "source": "yt-dlp",
+                   "too_long": 0}
     assert check_source(path) == 3
 
     rows = {r["tt_video_id"]: r for r in fetch_candidates(path, limit=10)}

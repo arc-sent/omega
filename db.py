@@ -6,7 +6,8 @@
     vk_accounts      — VK-аккаунты (токены) пользователя; один пользователь — много аккаунтов
     vk_groups        — целевые VK-группы; каждая привязана к одному аккаунту
     sources          — источники видео (путь к БД парсера + фильтр по нику; у источников-
-                       аккаунтов platform = tiktok/youtube — какой парсер их ведёт)
+                       аккаунтов platform = tiktok/youtube/youtube_videos — какой
+                       парсер их ведёт)
     rules            — правило = пара (источник → группа) + настройки публикации
     published        — что уже опубликовано по каждому правилу (дедуп)
     scheduled_posts  — запланированные публикации (переживают рестарт бота)
@@ -451,7 +452,8 @@ def add_source(
     *, kind: str = "db", account: str | None = None, account_id: int | None = None,
     platform: str = "tiktok",
 ) -> int:
-    """platform — только для kind='account': 'tiktok' или 'youtube'."""
+    """platform — только для kind='account': 'tiktok', 'youtube' (шортсы)
+    или 'youtube_videos' (полноценные ролики канала)."""
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO sources "

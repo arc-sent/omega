@@ -1,7 +1,8 @@
 """Источник-аккаунт: бот сам парсит аккаунт в свою базу.
 
 Платформа источника (sources.platform) выбирает парсер: 'tiktok' — parser_tiktok
-(перенесённый парсер), 'youtube' — parser_youtube (шортсы канала). Оба пишут в
+(перенесённый парсер), 'youtube' — parser_youtube (шортсы канала), 'youtube_videos'
+— parser_youtube (полноценные ролики канала, вкладка «Видео»). Все пишут в
 базу одного формата (таблица videos) — отдельную SQLite-базу источника в
 data/sources/. Дальше правила читают её так же, как внешнюю базу парсера.
 """
@@ -13,6 +14,9 @@ import sqlite3
 import db
 import parser_tiktok as pt
 import parser_youtube as yt
+
+# Платформа YouTube-источника → вкладка канала.
+YOUTUBE_TABS = {"youtube": "shorts", "youtube_videos": "videos"}
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +37,17 @@ def source_db_path(source_id: int) -> str:
 
 def normalize(account: str, platform: str = "tiktok") -> tuple[str, str]:
     """(username, profile_url) из ссылки/ника. Бросает ValueError при мусоре."""
-    if platform == "youtube":
-        return yt.normalize_channel(account)
+    if platform in YOUTUBE_TABS:
+        return yt.normalize_channel(account, YOUTUBE_TABS[platform])
     return pt.normalize_account(account)
 
 
-def _fetch_youtube(account: str, limit: int, start: int = 1) -> tuple[str, list, str]:
-    """Шортсы канала окном [start, start+limit) + длительности из плейлиста загрузок."""
-    name, shorts_url = yt.normalize_channel(account)
-    entries, channel_id = yt.fetch_shorts(shorts_url, limit, start)
+def _fetch_youtube(account: str, limit: int, start: int = 1,
+                   tab: str = "shorts") -> tuple[str, list, str]:
+    """Ролики вкладки канала окном [start, start+limit) + длительности из плейлиста
+    загрузок (у шортсов в плоском режиме их нет; у «Видео» обычно есть сразу)."""
+    name, tab_url = yt.normalize_channel(account, tab)
+    entries, channel_id = yt.fetch_tab(tab_url, limit, start, tab)
     try:
         yt.fill_durations(channel_id, entries)
     except Exception:
@@ -57,8 +63,8 @@ def _fetch(account: str, limit: int, start: int = 1,
     start=1 — с самого свежего; start=20 — пропустить 19 свежих. Вернуть
     (username, entries, source).
     """
-    if platform == "youtube":
-        return _fetch_youtube(account, limit, start)
+    if platform in YOUTUBE_TABS:
+        return _fetch_youtube(account, limit, start, YOUTUBE_TABS[platform])
     username, profile_url = pt.normalize_account(account)
     is_username_form = profile_url.startswith("https://")
 
@@ -72,6 +78,22 @@ def _fetch(account: str, limit: int, start: int = 1,
         entries = pt.fetch_videos_embed(username, limit, start)
         source = "embed"
     return username, entries, source
+
+
+def _drop_too_long(entries: list, platform: str) -> tuple[list, int]:
+    """Для полноценных роликов YouTube — не пускать в базу то, что не скачается.
+
+    Ролик длиннее YOUTUBE_VIDEO_MAX_DURATION downloader отвергнет, а упавший пост
+    не попадает в published — правило брало бы его снова каждый день. Поэтому
+    такие ролики в базу источника не пишем; поднимут лимит — ближайший до-парсинг
+    их добавит. Неизвестная длительность не отбрасывается (как и в фильтре правил).
+    Возвращает (что сохранять, сколько отброшено).
+    """
+    if platform != "youtube_videos":
+        return entries, 0
+    from downloader import YOUTUBE_VIDEO_MAX_DURATION as limit
+    kept = [e for e in entries if e.get("duration") is None or e["duration"] <= limit]
+    return kept, len(entries) - len(kept)
 
 
 def _save(username: str, db_path: str, entries: list) -> int:
@@ -106,10 +128,12 @@ def refresh_account(account: str, db_path: str, limit: int = PARSE_LIMIT,
     yt-dlp, ни embed не смогли собрать видео.
     """
     username, entries, source = _fetch(account, limit, start, platform)
-    added = _save(username, db_path, entries)
-    logger.info("Парсинг %s @%s: старт %s, всего %s, новых %s (источник %s)",
-                platform, username, start, len(entries), added, source)
-    return {"username": username, "added": added, "total": len(entries), "source": source}
+    to_save, too_long = _drop_too_long(entries, platform)
+    added = _save(username, db_path, to_save)
+    logger.info("Парсинг %s @%s: старт %s, всего %s, новых %s, длиннее лимита %s (источник %s)",
+                platform, username, start, len(entries), added, too_long, source)
+    return {"username": username, "added": added, "total": len(entries), "source": source,
+            "too_long": too_long}
 
 
 def deepen_account(account: str, db_path: str, step: int = PARSE_STEP,
@@ -123,10 +147,16 @@ def deepen_account(account: str, db_path: str, step: int = PARSE_STEP,
 
     Возвращает refresh-словарь + exhausted (yt-dlp дошёл до дна аккаунта) и
     can_deepen (источник умеет уходить глубже — только yt-dlp, не embed).
+
+    У youtube_videos слишком длинные ролики в базу не пишутся (_drop_too_long),
+    поэтому окно растёт только за счёт подходящих: если в очередных step роликах
+    канала нет ни одного подходящего, проход ничего не добавит. exhausted считается
+    по всем полученным роликам, а не по сохранённым.
     """
     limit = count_videos(db_path) + step
     username, entries, source = _fetch(account, limit, platform=platform)
-    added = _save(username, db_path, entries)
+    to_save, too_long = _drop_too_long(entries, platform)
+    added = _save(username, db_path, to_save)
     exhausted = source == "yt-dlp" and len(entries) < limit
     logger.info("Углубление @%s: просили %s, получили %s, новых %s%s",
                 username, limit, len(entries), added,
@@ -134,4 +164,5 @@ def deepen_account(account: str, db_path: str, step: int = PARSE_STEP,
     return {
         "username": username, "added": added, "total": len(entries),
         "source": source, "exhausted": exhausted, "can_deepen": source == "yt-dlp",
+        "too_long": too_long,
     }

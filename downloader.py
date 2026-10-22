@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 MAX_VIDEO_DURATION = 180  # секунд (3 минуты)
 
+# Полноценные ролики YouTube (не шортсы): свой лимит длительности и потолок
+# качества — каждый ролик идёт через прокси, а сервер слабый.
+YOUTUBE_VIDEO_MAX_DURATION = int(os.getenv("YOUTUBE_VIDEO_MAX_DURATION", "1200"))
+YOUTUBE_VIDEO_MAX_HEIGHT = int(os.getenv("YOUTUBE_VIDEO_MAX_HEIGHT", "1080"))
+
 # Прокси для скачивания видео (все платформы). Формат: http://user:pass@host:port
 DOWNLOAD_PROXY: str | None = os.getenv("DOWNLOAD_PROXY") or None
 
@@ -74,6 +79,11 @@ _YOUTUBE_RE = re.compile(
 )
 
 
+def is_youtube_long_video(url: str) -> bool:
+    """Полноценный ролик YouTube (watch/youtu.be/…), а не шортс."""
+    return bool(_YOUTUBE_RE.match(url)) and "/shorts/" not in url.lower()
+
+
 def detect_platform(url: str) -> str | None:
     """Возвращает 'tiktok', 'likee', 'youtube', 'vk' или None."""
     if _TIKTOK_RE.search(url):
@@ -106,6 +116,10 @@ def _download_ytdlp_sync(
 ) -> tuple[str, str]:
     _proxy = proxy or DOWNLOAD_PROXY
     cookies = None
+    # Полноценный ролик YouTube публикуется обычным видео, а не клипом: H.264 ради
+    # «Клипов» ему не нужен, а перекодировать минуты 1080p на слабом сервере — часы.
+    long_video = prefix == "youtube" and is_youtube_long_video(url)
+    max_duration = YOUTUBE_VIDEO_MAX_DURATION if long_video else MAX_VIDEO_DURATION
     if prefix == "youtube":
         # Из России YouTube заблокирован — свой прокси приоритетнее общего.
         _proxy = proxy or os.getenv("YOUTUBE_PROXY") or DOWNLOAD_PROXY
@@ -119,7 +133,7 @@ def _download_ytdlp_sync(
     # Фаза 1: получаем метаданные без скачивания — проверяем длительность
     with yt_dlp.YoutubeDL(meta_opts) as ydl:
         meta = ydl.extract_info(url, download=False)
-    _check_duration(meta.get("duration"))
+    _check_duration(meta.get("duration"), max_duration)
 
     # Фаза 2: скачиваем
     tmpdir = save_path or _tmp_path(f"{prefix}_dir")
@@ -138,6 +152,15 @@ def _download_ytdlp_sync(
         # загрузок не будут конкурировать за один и тот же кэш-файл.
         "cachedir": os.path.join(tmpdir, ".cache"),
     }
+    if long_video:
+        # Сразу H.264 не выше потолка: и перекодирование не понадобится, и трафик
+        # через прокси ограничен. Нет H.264 — берём что есть, но не выше потолка.
+        h = YOUTUBE_VIDEO_MAX_HEIGHT
+        ydl_opts["format"] = (
+            f"bestvideo[vcodec^=avc1][height<={h}]+bestaudio[ext=m4a]"
+            f"/best[vcodec^=avc1][height<={h}]"
+            f"/bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
+        )
     if _proxy:
         ydl_opts["proxy"] = _proxy
     if cookies:
@@ -159,6 +182,8 @@ def _download_ytdlp_sync(
         if not mp4s:
             raise RuntimeError(f"Файл ({prefix}) не был скачан")
         candidate = os.path.join(tmpdir, mp4s[0])
+    if long_video:
+        return candidate, title
     return _ensure_h264(candidate), title
 
 
@@ -182,6 +207,9 @@ async def download_tiktok(url: str, save_path: str | None = None) -> tuple[str, 
 
 async def download_youtube(url: str, save_path: str | None = None) -> tuple[str, str]:
     """Скачивает YouTube Shorts (и обычные видео) через yt-dlp.
+
+    Шортсы — лимит MAX_VIDEO_DURATION и H.264 для «Клипов»; полноценные ролики
+    (watch-ссылки) — лимит YOUTUBE_VIDEO_MAX_DURATION, без перекодирования.
 
     Возвращает (путь к файлу, название)."""
     loop = asyncio.get_running_loop()
@@ -283,11 +311,13 @@ def _find_duration(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _check_duration(duration: int | None) -> None:
-    """Бросает ValueError если длительность превышает лимит."""
-    if duration and duration > MAX_VIDEO_DURATION:
-        mins, secs = divmod(duration, 60)
-        raise ValueError(f"Видео слишком длинное — {mins}:{secs:02d}. Максимум 3 минуты.")
+def _check_duration(duration: int | None, limit: int = MAX_VIDEO_DURATION) -> None:
+    """Бросает ValueError если длительность превышает лимит (секунды)."""
+    if duration and duration > limit:
+        mins, secs = divmod(int(duration), 60)
+        lim_m, lim_s = divmod(int(limit), 60)
+        limit_text = f"{lim_m} мин" if not lim_s else f"{lim_m}:{lim_s:02d}"
+        raise ValueError(f"Видео слишком длинное — {mins}:{secs:02d}. Максимум {limit_text}.")
 
 
 def _ensure_h264(path: str) -> str:

@@ -20,6 +20,9 @@ services:
       # YouTube-источники. Из России YouTube заблокирован — нужен зарубежный прокси.
       # Куки кладутся в ./data/youtube_cookies.txt и подхватываются сами.
       - YOUTUBE_PROXY=${YOUTUBE_PROXY:-}
+      # Полноценные ролики YouTube (не шортсы): лимит длительности, сек, и потолок качества.
+      - YOUTUBE_VIDEO_MAX_DURATION=${YOUTUBE_VIDEO_MAX_DURATION:-1200}
+      - YOUTUBE_VIDEO_MAX_HEIGHT=${YOUTUBE_VIDEO_MAX_HEIGHT:-1080}
     volumes:
       - ./data:/app/data
       # Базы парсера должны быть доступны боту по тем же путям, что указаны в

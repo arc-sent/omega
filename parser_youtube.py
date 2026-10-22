@@ -1,7 +1,11 @@
-"""Парсер YouTube Shorts канала (для источников-аккаунтов с platform='youtube').
+"""Парсер YouTube-канала для источников-аккаунтов: шортсы (platform='youtube')
+или полноценные ролики (platform='youtube_videos').
 
 Перенесён из тестового скрипта youtube_shorts.py (проект «adrian»). Собирает
-список шортсов через yt-dlp в режиме extract_flat — сами видео НЕ скачиваются.
+список роликов вкладки Shorts или «Видео» через yt-dlp в режиме extract_flat —
+сами видео НЕ скачиваются. Шортсы пишутся ссылками youtube.com/shorts/<id>,
+обычные ролики — youtube.com/watch?v=<id>: по форме ссылки downloader решает,
+какой лимит длительности применять и нужен ли H.264 для «Клипов».
 Пишет в базу того же формата, что parser_tiktok (таблица videos; в колонке
 tt_video_id лежит id шортса), поэтому source_reader и правила работают без правок.
 
@@ -52,10 +56,17 @@ def _cookies() -> str | None:
     return cookies_path()
 
 
-def normalize_channel(raw: str) -> tuple[str, str]:
-    """Ссылка/@handle/имя/UC-id → (имя канала, ссылка на вкладку Shorts).
+# Вкладка канала → как строить ссылку на ролик.
+TABS = {
+    "shorts": "https://www.youtube.com/shorts/{id}",
+    "videos": "https://www.youtube.com/watch?v={id}",
+}
 
-    Бросает ValueError, если строка не похожа на канал.
+
+def normalize_channel(raw: str, tab: str = "shorts") -> tuple[str, str]:
+    """Ссылка/@handle/имя/UC-id → (имя канала, ссылка на вкладку tab).
+
+    tab — 'shorts' или 'videos'. Бросает ValueError, если строка не похожа на канал.
     """
     s = (raw or "").strip().rstrip("/")
     m = re.search(r"youtube\.com/(@[\w.\-]+|channel/UC[\w\-]{22}|c/[\w.\-]+|user/[\w.\-]+)", s)
@@ -68,7 +79,7 @@ def normalize_channel(raw: str) -> tuple[str, str]:
     else:
         raise ValueError("Не похоже на YouTube-канал. Пришли ссылку на канал или @handle.")
     name = path.split("/")[-1].lstrip("@")
-    return name, f"https://www.youtube.com/{path}/shorts"
+    return name, f"https://www.youtube.com/{path}/{tab}"
 
 
 def _opts(logger) -> dict:
@@ -104,10 +115,16 @@ class _Logger:
 
 
 def fetch_shorts(shorts_url: str, limit: int, start: int = 1) -> tuple[list, str | None]:
-    """(шортсы новые → старые, channel_id) без скачивания.
+    """(шортсы новые → старые, channel_id) без скачивания."""
+    return fetch_tab(shorts_url, limit, start, "shorts")
+
+
+def fetch_tab(tab_url: str, limit: int, start: int = 1,
+              tab: str = "shorts") -> tuple[list, str | None]:
+    """(ролики вкладки новые → старые, channel_id) без скачивания.
 
     start (1-based) и limit — окно, как у parser_tiktok.fetch_videos.
-    У каждой записи проставлен url вида https://www.youtube.com/shorts/<id>.
+    У каждой записи проставлен url по TABS[tab] (shorts/<id> или watch?v=<id>).
     """
     start = max(start, 1)
     log = _Logger()
@@ -115,12 +132,12 @@ def fetch_shorts(shorts_url: str, limit: int, start: int = 1) -> tuple[list, str
     opts["playliststart"] = start
     opts["playlistend"] = start + limit - 1
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(shorts_url, download=False)
+        info = ydl.extract_info(tab_url, download=False)
     entries = [e for e in ((info or {}).get("entries") or []) if e and e.get("id")]
     if not entries and log.errors:
         raise ExtractionError(describe_error(log.errors[-1]))
     for e in entries:
-        e["url"] = f"https://www.youtube.com/shorts/{e['id']}"
+        e["url"] = TABS[tab].format(id=e["id"])
     return entries, (info or {}).get("channel_id")
 
 
@@ -163,6 +180,8 @@ def describe_error(msg: str) -> str:
                 "Задай YOUTUBE_PROXY или DOWNLOAD_PROXY с зарубежным прокси.")
     elif "does not have a shorts tab" in text:
         hint = "У канала нет вкладки Shorts."
+    elif "does not have a videos tab" in text:
+        hint = "У канала нет вкладки «Видео»."
     elif "does not exist" in text or "404" in text:
         hint = "Канал не найден — проверь ссылку или @handle."
     else:
