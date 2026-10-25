@@ -4,6 +4,11 @@ FROM python:3.10-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# YouTube требует решать JS-проверки при каждом запросе: без JavaScript-рантайма
+# yt-dlp отдаёт неполный список форматов (ошибка «Requested format is not
+# available»). Deno — единственный рантайм, который yt-dlp включает по умолчанию.
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 WORKDIR /app
 
 COPY requirements.txt .

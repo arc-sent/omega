@@ -46,6 +46,11 @@ ERRORS_PAGE_SIZE = 8
 METRICS_HOUR = int(os.getenv("METRICS_HOUR", "23"))
 METRICS_MINUTE = int(os.getenv("METRICS_MINUTE", "50"))
 GROUPS_PAGE_SIZE = 15
+# Telegram: не больше 100 кнопок в сообщении, иначе правка/отправка клавиатуры падает
+# и список «не переключается». Размер страницы × кнопок на элемент держим << 100.
+ACCOUNTS_PAGE_SIZE = 6    # 5 кнопок на аккаунт
+SOURCES_PAGE_SIZE = 8     # до 4 кнопок на источник
+RULES_PAGE_SIZE = 15      # 1 кнопка на правило / источник в выборе
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -150,11 +155,38 @@ async def main_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await cmd_metrics(update, context)
 
 
+def _paginate(items: list, page: int, size: int) -> tuple[list, int, int]:
+    """(элементы страницы, номер страницы, всего страниц); номер зажимается в диапазон."""
+    pages = max(1, (len(items) + size - 1) // size)
+    page = max(0, min(page, pages - 1))
+    return items[page * size:(page + 1) * size], page, pages
+
+
+def _nav_row(prefix: str, page: int, pages: int) -> list:
+    """Ряд ⬅️ «стр/всего» ➡️ для callback_data вида <prefix>_<номер>; пусто, если страница одна."""
+    if pages <= 1:
+        return []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"{prefix}_{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"{prefix}_{page + 1}"))
+    return [nav]
+
+
 # ─── Аккаунты VK (токены) ─────────────────────────────────────────────────────
 
-def accounts_kb(telegram_id: int, current_account_id: int | None = None) -> InlineKeyboardMarkup:
+def accounts_kb(telegram_id: int, current_account_id: int | None = None,
+                page: int | None = None) -> InlineKeyboardMarkup:
+    """page=None — страница, на которой стоит текущий аккаунт (чтобы был виден ✅)."""
+    all_accounts = list(db.get_accounts(telegram_id))
+    if page is None:
+        idx = next((i for i, a in enumerate(all_accounts) if a["id"] == current_account_id), 0)
+        page = idx // ACCOUNTS_PAGE_SIZE
+    chunk, page, pages = _paginate(all_accounts, page, ACCOUNTS_PAGE_SIZE)
     rows = []
-    for a in db.get_accounts(telegram_id):
+    for a in chunk:
         is_active = a["id"] == current_account_id
         marker = "✅ " if is_active else ""
         token_hint = f" · {_mask_token(db.get_vk_token_by_account(a['id']) or '')}" if a["vk_token"] else " · (нет токена)"
@@ -168,6 +200,7 @@ def accounts_kb(telegram_id: int, current_account_id: int | None = None) -> Inli
             InlineKeyboardButton("🗑", callback_data=f"acc_del_{a['id']}"),
         ]
         rows.append(btn_row)
+    rows += _nav_row("acc_page", page, pages)
     rows.append([InlineKeyboardButton("➕ Добавить аккаунт", callback_data="acc_add")])
     return InlineKeyboardMarkup(rows)
 
@@ -203,6 +236,16 @@ async def acc_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if data == "noop":
         await query.answer()
+        return ConversationHandler.END
+
+    if data.startswith("acc_page_"):
+        await query.answer()
+        cur = _get_current_account(telegram_id, context.user_data)
+        await query.edit_message_text(
+            "Твои VK-аккаунты:",
+            reply_markup=accounts_kb(telegram_id, cur["id"] if cur else None,
+                                     int(data.rsplit("_", 1)[1])),
+        )
         return ConversationHandler.END
 
     if data == "acc_add":
@@ -392,13 +435,7 @@ def _rule_group_picker_kb(groups: list, page: int = 0) -> InlineKeyboardMarkup:
     page = max(0, min(page, pages - 1))
     rows = [[InlineKeyboardButton(f"{g['name']} (id {g['vk_group_id']})",
                                   callback_data=f"rule_grp_{g['id']}")] for g in groups[page * GROUPS_PAGE_SIZE:(page + 1) * GROUPS_PAGE_SIZE]]
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"rule_gpg_{page - 1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"rule_gpg_{page + 1}"))
-    if nav:
-        rows.append(nav)
+    rows += _nav_row("rule_gpg", page, pages)
     return InlineKeyboardMarkup(rows)
 
 
@@ -592,9 +629,12 @@ def _source_platform(s) -> str:
     return (s["platform"] if "platform" in s.keys() else None) or "tiktok"
 
 
-def sources_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboardMarkup:
+def sources_kb(telegram_id: int, account_id: int | None = None,
+               page: int = 0) -> InlineKeyboardMarkup:
+    chunk, page, pages = _paginate(
+        list(db.get_sources(telegram_id, for_account_id=account_id)), page, SOURCES_PAGE_SIZE)
     rows = []
-    for s in db.get_sources(telegram_id, for_account_id=account_id):
+    for s in chunk:
         if s["kind"] == "account":
             icon = SOURCE_ICONS.get(_source_platform(s), "🎵")
             label = f"{icon} {s['name']} (@{s['account']})"
@@ -608,6 +648,7 @@ def sources_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboar
             btn_row.append(InlineKeyboardButton(f"⚙️ Старт: {start}", callback_data=f"src_start_{s['id']}"))
         btn_row.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"src_del_{s['id']}"))
         rows.append(btn_row)
+    rows += _nav_row("src_page", page, pages)
     rows.append([InlineKeyboardButton("➕ Добавить источник", callback_data="src_add")])
     return InlineKeyboardMarkup(rows)
 
@@ -627,6 +668,15 @@ async def sources_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     telegram_id = update.effective_user.id
     if data == "noop":
         await query.answer()
+        return ConversationHandler.END
+    if data.startswith("src_page_"):
+        await query.answer()
+        cur = _get_current_account(telegram_id, context.user_data)
+        await query.edit_message_text(
+            "Твои источники:",
+            reply_markup=sources_kb(telegram_id, cur["id"] if cur else None,
+                                    int(data.rsplit("_", 1)[1])),
+        )
         return ConversationHandler.END
     if data == "src_add":
         await query.answer()
@@ -837,14 +887,25 @@ async def sources_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 # ─── Правила ──────────────────────────────────────────────────────────────────
 
-def rules_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboardMarkup:
+def rules_kb(telegram_id: int, account_id: int | None = None,
+             page: int = 0) -> InlineKeyboardMarkup:
+    chunk, page, pages = _paginate(
+        list(db.get_rules(telegram_id, account_id=account_id)), page, RULES_PAGE_SIZE)
     rows = []
-    for r in db.get_rules(telegram_id, account_id=account_id):
+    for r in chunk:
         mark = "🟢" if r["enabled"] else "⚪"
         rows.append([InlineKeyboardButton(
             f"{mark} {r['source_name']} → {r['group_name']}", callback_data=f"rule_open_{r['id']}"
         )])
+    rows += _nav_row("rule_page", page, pages)
     rows.append([InlineKeyboardButton("➕ Добавить правило", callback_data="rule_add")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _rule_source_picker_kb(sources: list, page: int = 0) -> InlineKeyboardMarkup:
+    chunk, page, pages = _paginate(list(sources), page, RULES_PAGE_SIZE)
+    rows = [[InlineKeyboardButton(s["name"], callback_data=f"rule_src_{s['id']}")] for s in chunk]
+    rows += _nav_row("rule_spg", page, pages)
     return InlineKeyboardMarkup(rows)
 
 
@@ -922,6 +983,31 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     cur_acc = _get_current_account(telegram_id, context.user_data)
     cur_acc_id = cur_acc["id"] if cur_acc else None
 
+    if data.startswith("rule_page_"):
+        await query.answer()
+        await query.edit_message_text(
+            "Твои правила публикации:",
+            reply_markup=rules_kb(telegram_id, cur_acc_id, int(data.rsplit("_", 1)[1])),
+        )
+        return
+
+    if data.startswith("rule_spg_"):
+        # Страница выбора источника: группа уже выбрана и лежит в user_data.
+        await query.answer()
+        group = db.get_group(context.user_data.get("new_rule_group") or 0)
+        if not group:
+            await query.edit_message_text(
+                "Что-то пошло не так, начни заново.",
+                reply_markup=rules_kb(telegram_id, cur_acc_id),
+            )
+            return
+        sources = db.get_sources(telegram_id, for_account_id=group["account_id"])
+        await query.edit_message_text(
+            "Теперь выбери источник:",
+            reply_markup=_rule_source_picker_kb(sources, int(data.rsplit("_", 1)[1])),
+        )
+        return
+
     if data == "rule_list":
         await query.answer()
         await query.edit_message_text(
@@ -962,8 +1048,8 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 reply_markup=rules_kb(telegram_id, cur_acc_id),
             )
             return
-        rows = [[InlineKeyboardButton(s["name"], callback_data=f"rule_src_{s['id']}")] for s in sources]
-        await query.edit_message_text("Теперь выбери источник:", reply_markup=InlineKeyboardMarkup(rows))
+        await query.edit_message_text("Теперь выбери источник:",
+                                      reply_markup=_rule_source_picker_kb(sources))
         return
 
     if data.startswith("rule_src_"):
@@ -1864,7 +1950,7 @@ def main() -> None:
 
     accounts_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(acc_button, pattern=r"^(acc_add|acc_rename_|acc_token_|acc_del_|acc_switch_|noop$)"),
+            CallbackQueryHandler(acc_button, pattern=r"^(acc_add|acc_rename_|acc_token_|acc_del_|acc_switch_|acc_page_\d+|noop$)"),
         ],
         states={
             ACC_NAME:         [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_name)],
@@ -1894,7 +1980,7 @@ def main() -> None:
     sources_conv = ConversationHandler(
         entry_points=[
             CommandHandler("sources", cmd_sources),
-            CallbackQueryHandler(sources_button, pattern=r"^(src_add|src_del_|src_refresh_|src_start_)"),
+            CallbackQueryHandler(sources_button, pattern=r"^(src_add|src_del_|src_refresh_|src_start_|src_page_\d+)"),
         ],
         states={
             SRC_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_name)],
@@ -1962,7 +2048,7 @@ def main() -> None:
     app.add_handler(rule_edit_conv)
     app.add_handler(CallbackQueryHandler(
         rules_button,
-        pattern=r"^(rule_list|rule_add|rule_src_|rule_grp_|rule_open_|rule_toggle_|rule_order_|rule_repost_|rule_now_|rule_del_)",
+        pattern=r"^(rule_list|rule_add|rule_gpg_|rule_spg_|rule_page_|rule_src_|rule_grp_|rule_open_|rule_toggle_|rule_order_|rule_repost_|rule_now_|rule_del_)",
     ))
 
     scheduler.register_jobs(app)

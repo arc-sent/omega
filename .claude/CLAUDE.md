@@ -59,8 +59,20 @@ Telegram-бот, который автоматически публикует в
   обязательно добавить в `COPY`, иначе контейнер падает с ModuleNotFoundError.
 - В контейнер попадают только переменные, перечисленные в `environment` compose-файла
   (env_file нет) — новую переменную окружения добавлять туда же.
+- **YouTube требует JS-рантайм**: без Deno yt-dlp получает неполный список форматов
+  («Requested format is not available»). Deno копируется в образ из `denoland/deno:bin`,
+  скрипты решения проверок (`yt-dlp-ejs`) приходят с `yt-dlp[default]` в requirements.
 - yt-dlp ставится при сборке образа; обновить его — пересобрать без кэша
   (`docker compose build --no-cache`), `pip install` на хосте контейнер не видит.
+
+## Кнопки Telegram (bot.py)
+- В сообщении **не больше 100 inline-кнопок**: иначе отправка/правка клавиатуры падает и
+  список «не переключается». Все длинные списки листаются (`_paginate` + `_nav_row`,
+  размеры — ACCOUNTS/SOURCES/RULES/GROUPS_PAGE_SIZE); новый список добавлять сразу со
+  страницами.
+- **Каждый `callback_data` обязан попадать в `pattern` какого-нибудь CallbackQueryHandler**
+  в `main()`, иначе кнопка молча не работает (так было с `rule_gpg_`). Новую кнопку —
+  сразу в шаблон; `tests/test_bot_keyboards.py::test_pager_callbacks_are_registered`.
 
 ## Проверка после изменений
 ```bash

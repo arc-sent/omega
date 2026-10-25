@@ -1,5 +1,6 @@
 python-telegram-bot[job-queue]==21.6
-yt-dlp>=2024.1.0
+# [default] ставит yt-dlp-ejs — скрипты для решения JS-проверок YouTube (вместе с Deno).
+yt-dlp[default]>=2024.1.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 pytz>=2024.1
