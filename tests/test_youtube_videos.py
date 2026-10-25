@@ -227,3 +227,63 @@ def test_shorts_limit_stays_3_min_without_env(fake_download, monkeypatch):
     with pytest.raises(ValueError, match="Максимум 3 мин"):
         downloader._download_ytdlp_sync(
             "https://www.youtube.com/shorts/vid", fake_download["dir"], "youtube", "YouTube Video")
+
+
+# ─── Язык звука ───────────────────────────────────────────────────────────────
+
+def _fmt(fid, ext, vcodec, acodec, lang=None, h=None):
+    d = {"format_id": fid, "ext": ext, "vcodec": vcodec, "acodec": acodec, "url": "u",
+         "protocol": "https"}
+    if lang:
+        d["language"] = lang
+    if h:
+        d["height"], d["width"] = h, h * 16 // 9
+    return d
+
+
+def _chosen(selector, formats):
+    import yt_dlp
+    with yt_dlp.YoutubeDL({"quiet": True, "format": selector, "format_sort": ["vcodec:h264"]}) as y:
+        res = list(y.build_format_selector(selector)(
+            {"formats": [dict(x) for x in formats], "incomplete_formats": False,
+             "has_merged_format": False}))
+    return [c["format_id"] for c in (res[0].get("requested_formats") or [res[0]])]
+
+
+SHORT_FMT = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+LONG_FMT = ("bestvideo[vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]"
+            "/best[vcodec^=avc1][height<=1080]/best")
+VIDEO = _fmt("299", "mp4", "avc1.64002A", "none", h=1080)
+EN = _fmt("140-0", "m4a", "none", "mp4a.40.2", "en-US")
+RU = _fmt("140-3", "m4a", "none", "mp4a.40.2", "ru")
+NOLANG = _fmt("140", "m4a", "none", "mp4a.40.2")
+
+
+@pytest.mark.parametrize("base", [SHORT_FMT, LONG_FMT])
+def test_prefer_audio_lang_picks_russian_track(base):
+    sel = downloader._prefer_audio_lang(base, "ru")
+    assert _chosen(sel, [EN, RU, VIDEO]) == ["299", "140-3"]
+
+
+@pytest.mark.parametrize("base", [SHORT_FMT, LONG_FMT])
+def test_prefer_audio_lang_falls_back_when_no_russian(base):
+    sel = downloader._prefer_audio_lang(base, "ru")
+    assert _chosen(sel, [EN, VIDEO]) == ["299", "140-0"]       # только английская
+    assert _chosen(sel, [NOLANG, VIDEO]) == ["299", "140"]     # язык не указан
+
+
+def test_prefer_audio_lang_disabled_or_no_audio_part():
+    assert downloader._prefer_audio_lang(SHORT_FMT, "") == SHORT_FMT
+    assert downloader._prefer_audio_lang("best", "ru") == "best"
+
+
+def test_youtube_download_uses_audio_lang(fake_download, monkeypatch):
+    monkeypatch.setattr(downloader, "YOUTUBE_AUDIO_LANG", "ru")
+    FakeDownloadYDL.duration = 50
+    downloader._download_ytdlp_sync(
+        "https://www.youtube.com/shorts/vid", fake_download["dir"], "youtube", "YouTube Video")
+    assert "language^=ru" in FakeDownloadYDL.download_opts["format"]
+    # TikTok язык звука не трогает
+    downloader._download_ytdlp_sync(
+        "https://www.tiktok.com/@a/video/1", fake_download["dir"], "tiktok", "TikTok Video")
+    assert "language^=" not in FakeDownloadYDL.download_opts["format"]

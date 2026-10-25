@@ -34,6 +34,10 @@ def _env_limit(name: str) -> int | None:
 # в env (по умолчанию без ограничения), и потолок качества — каждый ролик идёт
 # через прокси, а сервер слабый.
 YOUTUBE_VIDEO_MAX_DURATION: int | None = _env_limit("YOUTUBE_VIDEO_MAX_DURATION")
+# Язык звука YouTube: у роликов бывает несколько дорожек (оригинал, автодубляж).
+# Если есть дорожка на этом языке — берём её; нет — обычный выбор yt-dlp. Пусто — не
+# вмешиваться. Код языка — префикс поля language формата (ru, en, ...).
+YOUTUBE_AUDIO_LANG = os.getenv("YOUTUBE_AUDIO_LANG", "ru").strip().lower()
 YOUTUBE_VIDEO_MAX_HEIGHT = int(os.getenv("YOUTUBE_VIDEO_MAX_HEIGHT", "1080"))
 
 # Прокси для скачивания видео (все платформы). Формат: http://user:pass@host:port
@@ -87,6 +91,19 @@ _YOUTUBE_RE = re.compile(
     r"https?://(?:(?:www|m)\.)?(?:youtube\.com/(?:shorts/|watch\?|embed/|v/|live/)|youtu\.be/)",
     re.IGNORECASE,
 )
+
+
+def _prefer_audio_lang(fmt: str, lang: str) -> str:
+    """Селектор формата, который сначала пробует звук на языке lang, потом — как был.
+
+    Берёт первую альтернативу fmt («видео+звук») и вставляет в её звук фильтр
+    language^=lang. Формат без поля language фильтр не проходит и уходит в запасные
+    альтернативы, так что ролик без выбора языка скачивается как раньше.
+    """
+    first = fmt.split("/")[0]
+    if not lang or "+bestaudio[" not in first:
+        return fmt
+    return first.replace("+bestaudio[", f"+bestaudio[language^={lang}][", 1) + "/" + fmt
 
 
 def is_youtube_long_video(url: str) -> bool:
@@ -171,6 +188,8 @@ def _download_ytdlp_sync(
             f"/best[vcodec^=avc1][height<={h}]"
             f"/bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
         )
+    if prefix == "youtube" and YOUTUBE_AUDIO_LANG:
+        ydl_opts["format"] = _prefer_audio_lang(ydl_opts["format"], YOUTUBE_AUDIO_LANG)
     if _proxy:
         ydl_opts["proxy"] = _proxy
     if cookies:

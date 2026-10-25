@@ -24,6 +24,8 @@ services:
       # без лимита), и потолок качества.
       - YOUTUBE_VIDEO_MAX_DURATION=${YOUTUBE_VIDEO_MAX_DURATION:-}
       - YOUTUBE_VIDEO_MAX_HEIGHT=${YOUTUBE_VIDEO_MAX_HEIGHT:-1080}
+      # Язык звука YouTube: берём дорожку на этом языке, если она есть (пусто — не выбирать).
+      - YOUTUBE_AUDIO_LANG=${YOUTUBE_AUDIO_LANG:-ru}
       # Ежедневный снимок подписчиков всех групп для /metrics (МСК).
       - METRICS_HOUR=${METRICS_HOUR:-23}
       - METRICS_MINUTE=${METRICS_MINUTE:-50}
