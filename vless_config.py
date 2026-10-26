@@ -21,6 +21,8 @@ httpupgrade, http-заголовки tcp) скрипт отвергает с п�
 конфиг наугад. Файл с ключами создаётся с правами 600, а папка xray/ — в .gitignore.
 """
 
+from __future__ import annotations
+
 import base64
 import json
 import os
