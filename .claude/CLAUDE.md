@@ -65,6 +65,25 @@ Telegram-бот, который автоматически публикует в
 - yt-dlp ставится при сборке образа; обновить его — пересобрать без кэша
   (`docker compose build --no-cache`), `pip install` на хосте контейнер не видит.
 
+## Прокси для скачивания (TikTok, VLESS)
+- `DOWNLOAD_PROXY` (env, **передаётся в контейнер через compose**): TikTok сначала
+  качается напрямую (`proxy=""`), при сбое — повтор через него. `proxy=None` в
+  `_download_ytdlp_sync` означает «по умолчанию» (DOWNLOAD_PROXY), `""` — «без прокси»;
+  YouTube при None берёт YOUTUBE_PROXY, иначе DOWNLOAD_PROXY.
+- yt-dlp не знает VLESS: ключ подключается через контейнер Xray (compose-профиль `vless`,
+  `COMPOSE_PROFILES=vless`), который даёт SOCKS5 `xray:1080` — `DOWNLOAD_PROXY=socks5h://xray:1080`
+  (`h` — DNS на стороне прокси). Конфиг собирает `vless_config.py` из `VLESS_URL` в
+  `xray/config.json` (в .gitignore: там ключ). Порт 1080 наружу не публикуется.
+  Поддержаны tcp/ws/grpc и none/tls/reality; прочее скрипт отвергает, а не гадает.
+- `VLESS_URL` может быть адресом подписки (https://…, base64 или строки): берутся все vless,
+  заглушки 0.0.0.0 отбрасываются, отбор по имени — `VLESS_PICK`/`VLESS_SKIP` (части имён через
+  запятую). Несколько серверов → выходы `proxy-N` за балансировщиком leastPing + observatory
+  (проверка `PROBE_URL` = tiktok.com раз в `PROBE_INTERVAL` = 10m). Чаще не ставить: у всех
+  серверов подписки один ключ, на живом тесте поток подключений провайдер начал резать.
+  Пока observatory не дал результатов, трафик идёт в proxy-0 (fallbackTag).
+- VLESS — только для скачивания; загрузку в VK через зарубежный прокси не пускаем
+  (для VK есть `VK_PROXIES`).
+
 ## Кнопки Telegram (bot.py)
 - В сообщении **не больше 100 inline-кнопок**: иначе отправка/правка клавиатуры падает и
   список «не переключается». Все длинные списки листаются (`_paginate` + `_nav_row`,

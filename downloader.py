@@ -141,7 +141,8 @@ def _download_ytdlp_sync(
     default_title: str,
     proxy: str | None = None,
 ) -> tuple[str, str]:
-    _proxy = proxy or DOWNLOAD_PROXY
+    """proxy: None — прокси по умолчанию (DOWNLOAD_PROXY), "" — без прокси, иначе — он."""
+    _proxy = DOWNLOAD_PROXY if proxy is None else (proxy or None)
     cookies = None
     # Полноценный ролик YouTube публикуется обычным видео, а не клипом: H.264 ради
     # «Клипов» ему не нужен, а перекодировать минуты 1080p на слабом сервере — часы.
@@ -149,7 +150,8 @@ def _download_ytdlp_sync(
     max_duration = YOUTUBE_VIDEO_MAX_DURATION if long_video else MAX_VIDEO_DURATION
     if prefix == "youtube":
         # Из России YouTube заблокирован — свой прокси приоритетнее общего.
-        _proxy = proxy or os.getenv("YOUTUBE_PROXY") or DOWNLOAD_PROXY
+        if proxy is None:
+            _proxy = os.getenv("YOUTUBE_PROXY") or DOWNLOAD_PROXY
         cookies = _youtube_cookies()
     meta_opts: dict = {"quiet": True, "no_warnings": True}
     if _proxy:
@@ -218,7 +220,8 @@ def _download_ytdlp_sync(
 
 def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
     try:
-        return _download_ytdlp_sync(url, save_path, "tiktok", "TikTok Video", proxy=None)
+        # Сначала напрямую: "" — без прокси (None означало бы DOWNLOAD_PROXY).
+        return _download_ytdlp_sync(url, save_path, "tiktok", "TikTok Video", proxy="")
     except ValueError:
         raise  # видео слишком длинное — прокси не поможет
     except Exception as first_err:

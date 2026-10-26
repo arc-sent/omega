@@ -4,6 +4,8 @@
 token.key
 *.key
 *cookies*.txt
+# Конфиг Xray содержит VLESS-ключ
+xray/
 
 # Данные бота (база, состояние, временные видео)
 data/

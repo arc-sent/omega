@@ -20,6 +20,9 @@ services:
       # YouTube-источники. Из России YouTube заблокирован — нужен зарубежный прокси.
       # Куки кладутся в ./data/youtube_cookies.txt и подхватываются сами.
       - YOUTUBE_PROXY=${YOUTUBE_PROXY:-}
+      # Прокси для скачивания (TikTok — запасной путь после прямой попытки; YouTube — если
+      # не задан YOUTUBE_PROXY). Для VLESS: socks5h://xray:1080 (см. сервис xray ниже).
+      - DOWNLOAD_PROXY=${DOWNLOAD_PROXY:-}
       # Полноценные ролики YouTube (не шортсы): лимит длительности, сек (пусто или 0 —
       # без лимита), и потолок качества.
       - YOUTUBE_VIDEO_MAX_DURATION=${YOUTUBE_VIDEO_MAX_DURATION:-}
@@ -34,3 +37,16 @@ services:
       # Базы парсера должны быть доступны боту по тем же путям, что указаны в
       # источниках. Смонтируй папку с базами парсера сюда (пример):
       # - C:/Users/androed/Desktop/парсер:/parser:ro
+
+  # Локальный SOCKS5-прокси поверх VLESS-ключа: yt-dlp VLESS не знает. Включается профилем:
+  #   в .env: VLESS_URL=vless://… (или адрес подписки https://…)  COMPOSE_PROFILES=vless
+  #           DOWNLOAD_PROXY=socks5h://xray:1080   для подписки ещё VLESS_PICK=Финлян,США,Польша
+  #   затем:  python3 vless_config.py   (соберёт xray/config.json; после смены —
+  #           docker compose restart xray)
+  # Порт наружу НЕ публикуется — прокси доступен только боту внутри docker-сети.
+  xray:
+    image: teddysun/xray:latest
+    profiles: ["vless"]
+    restart: unless-stopped
+    volumes:
+      - ./xray:/etc/xray:ro
