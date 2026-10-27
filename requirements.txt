@@ -1,6 +1,8 @@
 python-telegram-bot[job-queue]==21.6
 # [default] ставит yt-dlp-ejs — скрипты для решения JS-проверок YouTube (вместе с Deno).
-yt-dlp[default]>=2024.1.0
+# [curl-cffi] — маскировка запросов под браузер (impersonate): без неё TikTok отвечает
+# «Your IP address is blocked» даже через зарубежный прокси.
+yt-dlp[default,curl-cffi]>=2024.1.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 pytz>=2024.1
