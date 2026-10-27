@@ -20,6 +20,7 @@ import db
 import video_processor
 from downloader import (
     detect_platform, download_tiktok, download_likee, download_youtube, download_vk,
+    unavailable_reason,
 )
 from vk import VKError, VK_RETRYABLE_ERROR_CODES, upload_to_vk
 
@@ -38,6 +39,8 @@ DAILY_PLAN_MINUTE = int(os.getenv("DAILY_PLAN_MINUTE", "5"))
 # Пока публикация на паузе (/stop), _publish_job не публикует, а переставляет
 # сам себя на повторную проверку через этот интервал — пост не теряется из очереди.
 PUBLISH_PAUSE_RECHECK_SECONDS = int(os.getenv("PUBLISH_PAUSE_RECHECK_SECONDS", "60"))
+# Ролик оказался недоступен насовсем — через столько секунд пробуем следующий того же правила.
+REPLACEMENT_DELAY_SECONDS = 60
 # Автодопарсинг истории: держим запас невыложенных кандидатов на столько дневных
 # норм вперёд; если меньше — углубляемся в историю (не больше N проходов за раз).
 BACKLOG_DAYS = int(os.getenv("BACKLOG_DAYS", "3"))
@@ -271,8 +274,10 @@ def plan_rule(job_queue, rule) -> int:
     if not times:
         return 0
 
-    # Исключаем уже опубликованные И уже стоящие в очереди — чтобы не задвоить.
-    exclude = db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id)
+    # Исключаем уже опубликованные И уже стоящие в очереди — чтобы не задвоить, —
+    # и ролики, которые площадка насовсем не отдаёт.
+    unavailable = db.get_unavailable_ids()
+    exclude = db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id) | unavailable
 
     try:
         candidates = fetch_candidates(
@@ -305,7 +310,7 @@ def plan_rule(job_queue, rule) -> int:
                 min_duration=rule["min_duration"],
                 max_duration=rule["max_duration"],
                 order_dir=rule["order_dir"],
-                exclude_ids=db.get_scheduled_ids(rule_id),
+                exclude_ids=db.get_scheduled_ids(rule_id) | unavailable,
                 limit=remaining,
             )
         except SourceError as e:
@@ -355,20 +360,36 @@ def schedule_test_now(job_queue, rule_id: int) -> tuple[bool, str]:
     if not rule["account_id"] or not db.get_vk_token_by_account(rule["account_id"]):
         return False, "Сначала задай VK токен для аккаунта этой группы."
 
-    exclude = db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id)
     try:
-        cands = fetch_candidates(
-            rule["db_path"], username=rule["username"],
-            min_duration=rule["min_duration"], max_duration=rule["max_duration"],
-            order_dir=rule["order_dir"], exclude_ids=exclude, limit=1,
-        )
+        v, post_id = _schedule_next_video(job_queue, rule, delay_seconds=5)
     except SourceError as e:
         return False, f"Источник недоступен: {e}"
-    if not cands:
+    if not v:
         return False, "Нет новых видео (все уже опубликованы или в очереди)."
+    if post_id is None:
+        return False, "Это видео уже стоит в очереди на публикацию."
+    return True, f"▶️ Публикую тестовое видео (~через 5 сек):\n{v['url']}"
 
+
+def _schedule_next_video(job_queue, rule, delay_seconds: int):
+    """Поставить следующее по порядку правила видео на публикацию через delay_seconds.
+
+    Соблюдает дедуп (опубликованные, очередь, недоступные), квоту не смотрит.
+    Возвращает (видео | None, post_id | None). Бросает SourceError."""
+    from source_reader import fetch_candidates
+
+    rule_id = rule["id"]
+    exclude = (db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id)
+               | db.get_unavailable_ids())
+    cands = fetch_candidates(
+        rule["db_path"], username=rule["username"],
+        min_duration=rule["min_duration"], max_duration=rule["max_duration"],
+        order_dir=rule["order_dir"], exclude_ids=exclude, limit=1,
+    )
+    if not cands:
+        return None, None
     v = cands[0]
-    publish_at = int(datetime.now(MOSCOW_TZ).timestamp()) + 5
+    publish_at = int(datetime.now(MOSCOW_TZ).timestamp()) + delay_seconds
     post_id = db.add_scheduled_post(
         telegram_id=rule["telegram_id"], rule_id=rule_id,
         tt_video_id=v["tt_video_id"], url=v["url"], title=v["title"],
@@ -376,10 +397,33 @@ def schedule_test_now(job_queue, rule_id: int) -> tuple[bool, str]:
         vk_group_name=rule["group_name"], publish_at=publish_at,
         account_id=rule["account_id"],
     )
-    if post_id is None:
-        return False, "Это видео уже стоит в очереди на публикацию."
-    _schedule_post_job(job_queue, {"id": post_id, "publish_at": publish_at})
-    return True, f"▶️ Публикую тестовое видео (~через 5 сек):\n{v['url']}"
+    if post_id is not None:
+        _schedule_post_job(job_queue, {"id": post_id, "publish_at": publish_at})
+    return v, post_id
+
+
+def schedule_replacement(job_queue, rule_id: int) -> str | None:
+    """Вместо недоступного ролика — следующий того же правила через REPLACEMENT_DELAY_SECONDS.
+
+    Слот дня не пропадает: упавший пост не засчитан ни в очередь, ни в опубликованные,
+    так что замена укладывается в дневную квоту. Если и замена окажется мёртвой, она
+    тоже пометится и потянет следующую — цепочка конечна, ведь каждый мёртвый ролик
+    выбывает навсегда. Возвращает url замены или None (правило выключено/нечего ставить).
+    """
+    from source_reader import SourceError
+
+    rule = db.get_rule(rule_id)
+    if not rule or not rule["enabled"]:
+        return None
+    try:
+        v, post_id = _schedule_next_video(job_queue, rule, REPLACEMENT_DELAY_SECONDS)
+    except SourceError as e:
+        logger.warning("Правило %s: замену не поставить, источник недоступен: %s", rule_id, e)
+        return None
+    if not v or post_id is None:
+        return None
+    logger.info("Правило %s: вместо недоступного ролика ставлю %s", rule_id, v["url"])
+    return v["url"]
 
 
 # ─── Джобы ────────────────────────────────────────────────────────────────────
@@ -389,35 +433,53 @@ def _source_platform(source) -> str:
     return (source["platform"] if "platform" in source.keys() else None) or "tiktok"
 
 
-async def refresh_account_sources(context_or_app) -> int:
+# Один прогон по всем источникам за раз: ежедневный джоб и /reparse не накладываются.
+_refresh_lock = asyncio.Lock()
+
+
+def is_refreshing_sources() -> bool:
+    return _refresh_lock.locked()
+
+
+async def refresh_account_sources(context_or_app, on_result=None) -> int:
     """До-парсить все источники-аккаунты (собрать свежие ссылки в их базы).
 
     Каждый прогон парсера — блокирующий (сеть/yt-dlp), поэтому уводим в executor.
     Ошибка одного аккаунта не мешает остальным и логируется в /errors владельца.
+    on_result(source, index, total, res | None, exc | None) — async-колбэк после
+    каждого источника (прогресс для /reparse).
     """
     import account_source
 
-    sources = db.get_account_sources()
-    if not sources:
-        return 0
-    loop = asyncio.get_running_loop()
-    refreshed = 0
-    for s in sources:
-        db_path = s["db_path"] or account_source.source_db_path(s["id"])
-        start = s["parse_start"] if "parse_start" in s.keys() else 1
-        platform = _source_platform(s)
-        try:
-            res = await loop.run_in_executor(
-                None, account_source.refresh_account, s["account"], db_path,
-                account_source.PARSE_LIMIT, start, platform,
-            )
-            refreshed += 1
-            logger.info("Источник %s (%s @%s): +%s новых",
-                        s["id"], platform, res["username"], res["added"])
-        except Exception as exc:
-            logger.exception("Не удалось спарсить источник %s (%s)", s["id"], s["account"])
-            _record_error(s["telegram_id"], exc, stage="парсинг аккаунта", platform=platform)
-    return refreshed
+    async with _refresh_lock:
+        sources = db.get_account_sources()
+        if not sources:
+            return 0
+        loop = asyncio.get_running_loop()
+        refreshed = 0
+        for i, s in enumerate(sources, 1):
+            db_path = s["db_path"] or account_source.source_db_path(s["id"])
+            start = s["parse_start"] if "parse_start" in s.keys() else 1
+            platform = _source_platform(s)
+            res, error = None, None
+            try:
+                res = await loop.run_in_executor(
+                    None, account_source.refresh_account, s["account"], db_path,
+                    account_source.PARSE_LIMIT, start, platform,
+                )
+                refreshed += 1
+                logger.info("Источник %s (%s @%s): +%s новых",
+                            s["id"], platform, res["username"], res["added"])
+            except Exception as exc:
+                error = exc
+                logger.exception("Не удалось спарсить источник %s (%s)", s["id"], s["account"])
+                _record_error(s["telegram_id"], exc, stage="парсинг аккаунта", platform=platform)
+            if on_result:
+                try:
+                    await on_result(s, i, len(sources), res, error)
+                except Exception:
+                    logger.exception("Колбэк прогресса перепарсинга упал")
+        return refreshed
 
 
 def _min_remaining(src_rules, cap: int) -> int:
@@ -598,11 +660,21 @@ async def _publish_job(context) -> None:
         stage = exc.stage if isinstance(exc, VKError) else "публикация"
         _record_error(telegram_id, exc, stage=stage, platform=platform, url=url,
                       vk_group_id=vk_group_id, vk_group_name=group_name)
+        # Ролик удалён/скрыт — иначе правило брало бы его каждый день заново.
+        reason = unavailable_reason(exc)
+        skip_note = ""
+        if reason:
+            db.mark_unavailable(post["tt_video_id"], reason)
+            skip_note = "\n⏭ Ролик недоступен — больше не ставлю его в план."
+            replacement = schedule_replacement(context.job_queue, rule_id)
+            if replacement:
+                skip_note += (f"\n🔁 Вместо него через {REPLACEMENT_DELAY_SECONDS} с "
+                              f"выложу следующий: {replacement}")
         try:
             await context.bot.send_message(
                 telegram_id,
                 f"❌ Не удалось опубликовать в «{group_name}»:\n{exc}\n\n"
-                f"🔗 {url}\nℹ️ Подробности — в /errors",
+                f"🔗 {url}\nℹ️ Подробности — в /errors{skip_note}",
             )
         except Exception:
             pass

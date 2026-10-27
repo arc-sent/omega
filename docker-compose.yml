@@ -20,6 +20,8 @@ services:
       # YouTube-источники. Из России YouTube заблокирован — нужен зарубежный прокси.
       # Куки кладутся в ./data/youtube_cookies.txt и подхватываются сами.
       - YOUTUBE_PROXY=${YOUTUBE_PROXY:-}
+      # Сколько последних роликов аккаунта парсить за прогон (пусто или 0 — все).
+      - PARSE_LIMIT=${PARSE_LIMIT:-}
       # Прокси для скачивания (TikTok — запасной путь после прямой попытки; YouTube — если
       # не задан YOUTUBE_PROXY). Для VLESS: socks5h://xray:1080 (см. сервис xray ниже).
       - DOWNLOAD_PROXY=${DOWNLOAD_PROXY:-}

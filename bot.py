@@ -1921,6 +1921,49 @@ async def cmd_start_publishing(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("▶️ Публикация возобновлена.")
 
 
+# ─── /reparse — перепарсинг всех источников-аккаунтов ─────────────────────────
+
+async def cmd_reparse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Прогнать парсер по всем источникам-аккаунтам всех пользователей (только ADMIN_IDS).
+
+    Идёт в фоне: бот отвечает дальше, прогресс — правкой одного сообщения."""
+    if not _is_admin(update.effective_user.id):
+        return
+    if scheduler.is_refreshing_sources():
+        await update.message.reply_text("⏳ Парсинг источников уже идёт — дождись его окончания.")
+        return
+    total = len(db.get_account_sources())
+    if not total:
+        await update.message.reply_text("Источников-аккаунтов нет — парсить нечего.")
+        return
+    status = await update.message.reply_text(f"⏳ Перепарсинг {total} источников…")
+    context.application.create_task(_run_reparse(status), update=update)
+
+
+async def _run_reparse(status) -> None:
+    added, failed = 0, []
+
+    async def on_result(s, i, total, res, exc):
+        nonlocal added
+        if exc is None:
+            added += res["added"]
+        else:
+            failed.append(f"• {s['name']} (@{s['account']}): {str(exc)[:120]}")
+        try:
+            await status.edit_text(f"⏳ Перепарсинг: {i}/{total}, новых роликов {added}…")
+        except Exception:
+            pass  # «message is not modified» и т.п. — прогресс не важнее парсинга
+
+    ok = await scheduler.refresh_account_sources(None, on_result=on_result)
+    text = f"✅ Перепарсинг готов: успешно {ok}, новых роликов {added}."
+    if failed:
+        text += f"\n\n❌ Ошибки ({len(failed)}), подробности — в /errors:\n" + "\n".join(failed[:20])
+    try:
+        await status.edit_text(text[:4000])
+    except Exception:
+        await status.reply_text(text[:4000])
+
+
 # ─── /cancel ──────────────────────────────────────────────────────────────────
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2034,6 +2077,7 @@ def main() -> None:
     app.add_handler(CommandHandler("startBot", cmd_start_publishing))
     app.add_handler(CommandHandler("process", cmd_process))
     app.add_handler(CommandHandler("metrics", cmd_metrics))
+    app.add_handler(CommandHandler("reparse", cmd_reparse))
     app.add_handler(CallbackQueryHandler(metrics_callback, pattern=r"^met_(refresh|text|chart_\d+)$"))
     app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats_period_"))
     app.add_handler(CallbackQueryHandler(stats_chart_callback, pattern=r"^stats_chart_"))

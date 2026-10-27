@@ -27,6 +27,15 @@ Telegram-бот, который автоматически публикует в
 - Источник читается **только на чтение** (`source_reader._connect_ro`, mode=ro) —
   файл базы парсера бот не меняет.
 - Видео с неизвестной длительностью фильтр по секундам НЕ отбрасывает.
+- **Недоступные ролики**: упавший пост в `published` не попадает, и правило брало бы его
+  каждый день (а при order «old» — первым). Если ошибка скачивания означает «насовсем»
+  (`downloader.unavailable_reason`: удалён/приватный; TikTok «IP blocked» = статус 10204 —
+  только если DOWNLOAD_PROXY задан, т.е. прокси уже пробовали), `_publish_job` пишет id в
+  `unavailable_videos` (общая на все правила), а plan_rule/schedule_test_now его исключают.
+  Сетевые сбои и «слишком длинное» сюда не попадают. Сразу после пометки
+  `schedule_replacement` ставит следующий ролик того же правила через
+  REPLACEMENT_DELAY_SECONDS (60 с): слот дня не теряется, квота не превышается (упавший
+  пост не засчитан), мёртвая замена тянет следующую — цепочка конечна.
 - Токены маскируются в логах ошибок (db._sanitize): access_token=*** / vk1.a.***.
 
 ## Планировщик (scheduler.py)
@@ -115,7 +124,14 @@ python -m pytest -q
 - До-парсинг: `scheduler.refresh_account_sources` вызывается в daily_plan_job (раз в
   сутки перед раскладкой) и в restore_and_schedule (при старте). Плюс кнопка
   «🔄 Обновить» в источнике (bot._refresh_source). Прогон парсера — в executor (блокирующий).
-- PARSE_LIMIT (env, 200) — сколько последних видео проверять за прогон.
+- `/reparse` (только ADMIN_IDS) — перепарсинг всех источников-аккаунтов всех юзеров в фоне
+  (`application.create_task`), прогресс правкой одного сообщения через `on_result`
+  у `refresh_account_sources`. `scheduler._refresh_lock`: ежедневный прогон и /reparse не
+  накладываются (`is_refreshing_sources`).
+- PARSE_LIMIT (env, передаётся через compose) — сколько последних видео проверять за
+  прогон; не задан/пуст/0 (по умолчанию) — все ролики аккаунта (`account_source.UNLIMITED`,
+  большое окно: parser_tiktok не правим). Длительности YouTube тогда ищутся не меньше
+  чем по числу собранных роликов (а не только YOUTUBE_DURATION_SCAN).
 - `parser_youtube.py` — шортсы YouTube (из тестового скрипта проекта «adrian»). Пишет
   в базу того же формата через `parser_tiktok.init_db/save_videos` (в `tt_video_id` —
   id шортса, url = youtube.com/shorts/<id>). Вкладка Shorts длительность не отдаёт, а

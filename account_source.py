@@ -23,8 +23,19 @@ logger = logging.getLogger(__name__)
 SOURCES_DIR = os.path.join(db.DATA_DIR, "sources")
 os.makedirs(SOURCES_DIR, exist_ok=True)
 
-# Сколько последних видео проверять за один прогон парсера.
-PARSE_LIMIT = int(os.getenv("PARSE_LIMIT", "200"))
+# «Без лимита» для парсеров — окно заведомо больше любого аккаунта (playlistend/срез
+# списка принимают число, а не None; parser_tiktok — копия, его не правим).
+UNLIMITED = 1_000_000
+
+
+def _parse_limit_from_env() -> int:
+    raw = (os.getenv("PARSE_LIMIT") or "").strip()
+    n = int(raw) if raw else 0
+    return n if n > 0 else UNLIMITED
+
+
+# Сколько последних видео проверять за один прогон парсера: не задано/пусто/0 — все.
+PARSE_LIMIT = _parse_limit_from_env()
 
 # На сколько роликов углубляться в историю за один проход допарсинга.
 PARSE_STEP = int(os.getenv("PARSE_STEP", "200"))
@@ -49,7 +60,10 @@ def _fetch_youtube(account: str, limit: int, start: int = 1,
     name, tab_url = yt.normalize_channel(account, tab)
     entries, channel_id = yt.fetch_tab(tab_url, limit, start, tab)
     try:
-        yt.fill_durations(channel_id, entries)
+        # Плейлист загрузок просматриваем не меньше, чем роликов собрали, — иначе при
+        # большом окне хвост останется без длительностей.
+        yt.fill_durations(channel_id, entries,
+                          max(yt.DURATION_SCAN, start - 1 + len(entries)))
     except Exception:
         # Длительность — бонус: без неё видео всё равно годятся (фильтр их не режет).
         logger.warning("YouTube %s: не удалось узнать длительности", name, exc_info=True)

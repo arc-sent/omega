@@ -141,6 +141,14 @@ def init_db() -> None:
                 value TEXT NOT NULL
             );
 
+            -- Ролики, которые площадка не отдаёт насовсем (удалены, скрыты, закрыты для
+            -- региона и прокси). Общие для всех правил: в план больше не берутся.
+            CREATE TABLE IF NOT EXISTS unavailable_videos (
+                tt_video_id TEXT PRIMARY KEY,
+                reason      TEXT,
+                marked_at   INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS error_logs (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id   INTEGER NOT NULL,
@@ -641,6 +649,23 @@ def mark_published(rule_id: int, tt_video_id: str) -> None:
             "INSERT OR IGNORE INTO published (rule_id, tt_video_id, published_at) VALUES (?, ?, ?)",
             (rule_id, tt_video_id, int(time.time())),
         )
+
+
+# ─── Недоступные ролики ───────────────────────────────────────────────────────
+
+def mark_unavailable(tt_video_id: str, reason: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO unavailable_videos (tt_video_id, reason, marked_at) "
+            "VALUES (?, ?, ?)",
+            (tt_video_id, reason, int(time.time())),
+        )
+
+
+def get_unavailable_ids() -> set[str]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT tt_video_id FROM unavailable_videos").fetchall()
+    return {r["tt_video_id"] for r in rows}
 
 
 def count_published(rule_id: int) -> int:

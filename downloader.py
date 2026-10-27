@@ -218,6 +218,30 @@ def _download_ytdlp_sync(
     return _ensure_h264(candidate), title
 
 
+# Ответы площадок, после которых повторять бессмысленно: ролик удалён, скрыт или закрыт.
+# Такой ролик планировщик помечает недоступным и больше не ставит в план.
+_UNAVAILABLE_MARKERS = (
+    "You do not have permission to view this post",   # TikTok: приватный пост/аккаунт
+    "Video unavailable",                              # YouTube
+    "Private video",
+    "This video has been removed",
+)
+# TikTok (статус 10204) отвечает так и на удалённый, и на закрытый по региону пост. Насовсем
+# считаем, только если уже пробовали через прокси, иначе прокси мог бы помочь.
+_TIKTOK_BLOCKED_MARKER = "Your IP address is blocked from accessing this post"
+
+
+def unavailable_reason(exc: BaseException) -> str | None:
+    """Причина, если ошибка скачивания означает «ролик недоступен насовсем», иначе None."""
+    text = str(exc)
+    if _TIKTOK_BLOCKED_MARKER in text:
+        return "TikTok не отдаёт пост (удалён или закрыт для региона)" if DOWNLOAD_PROXY else None
+    for marker in _UNAVAILABLE_MARKERS:
+        if marker in text:
+            return marker
+    return None
+
+
 def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
     try:
         # Сначала напрямую: "" — без прокси (None означало бы DOWNLOAD_PROXY).
