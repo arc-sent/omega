@@ -1,7 +1,7 @@
 """Метрика VK-групп: снимки числа подписчиков и отчёт о росте (/metrics, только админ).
 
-Отчёт отдаётся PDF-файлом (build_pdf): сводка и общий график, таблица всех групп,
-мини-графики по каждой группе. Рисуется matplotlib (PdfPages) — без доп. зависимостей.
+Отчёт отдаётся PDF-файлом (build_pdf): сводка и общий график, сводка по VK-аккаунтам,
+затем по каждому аккаунту — таблица его групп и мини-графики. Рисуется matplotlib (PdfPages) — без доп. зависимостей.
 
 Снимок — число подписчиков каждой группы всех пользователей на момент вызова
 (groups.getById, fields=members_count). Снимки пишутся в db.group_metrics:
@@ -46,6 +46,27 @@ def _group_candidates() -> tuple[dict[int, list[int]], dict[int, str]]:
         if g["account_id"] is not None and g["account_id"] not in lst:
             lst.append(g["account_id"])
     return cands, names
+
+
+def _accounts() -> list[dict]:
+    """VK-аккаунты всех пользователей с их группами (для разбивки отчёта).
+
+    [{"name": "Основной · tg 123", "gids": [vk_group_id, ...]}, ...] — по владельцу и
+    порядку добавления. Общая группа двух аккаунтов попадает в оба; группы без
+    аккаунта (account_id NULL) собираются в «Без аккаунта» своего владельца.
+    """
+    accs: dict[tuple, dict] = {}
+    for g in db.get_all_groups_for_metrics():
+        gid = abs(int(g["vk_group_id"]))
+        aid = g["account_id"]
+        key = (g["telegram_id"], aid if aid is not None else -1)
+        acc = accs.get(key)
+        if acc is None:
+            label = (g["account_name"] or f"Аккаунт {aid}") if aid is not None else "Без аккаунта"
+            acc = accs[key] = {"name": f"{label} · tg {g['telegram_id']}", "gids": []}
+        if gid not in acc["gids"]:
+            acc["gids"].append(gid)
+    return [accs[k] for k in sorted(accs, key=lambda k: (k[0], k[1] < 0, k[1]))]
 
 
 def collect_snapshot() -> dict:
@@ -137,15 +158,35 @@ def report_data(now: int | None = None) -> dict:
             "posts": db.count_published_to_vk_group(gid, now - 7 * DAY, now + 1),
         })
     rows.sort(key=lambda r: r["members"], reverse=True)
+    by_gid = {r["gid"]: r for r in rows}
+    accounts = []
+    for acc in _accounts():
+        acc_rows = [by_gid[g] for g in acc["gids"] if g in by_gid]
+        acc_rows.sort(key=lambda r: r["members"], reverse=True)
+        accounts.append({
+            "name": acc["name"], "groups": len(acc["gids"]), "rows": acc_rows,
+            "missing": [g for g in acc["gids"] if g not in by_gid],
+            "total": sum(r["members"] for r in acc_rows), "totals": _sum_deltas(acc_rows),
+        })
+    return {
+        "now": now, "names": names, "groups": len(cands), "rows": rows, "missing": missing,
+        "total": sum(r["members"] for r in rows), "totals": _sum_deltas(rows),
+        "accounts": accounts,
+        "has_approx": any(r["deltas"][d][1] for r in rows for d in DELTA_PERIODS),
+    }
+
+
+def _sum_deltas(rows: list[dict]) -> dict[int, tuple[int | None, bool]]:
+    """Суммарный прирост строк по периодам: {дней: (сумма|None, есть ли «*»)}."""
     totals = {}
     for d in DELTA_PERIODS:
         vals = [r["deltas"][d][0] for r in rows if r["deltas"][d][0] is not None]
         totals[d] = (sum(vals) if vals else None, any(r["deltas"][d][1] for r in rows))
-    return {
-        "now": now, "names": names, "groups": len(cands), "rows": rows, "missing": missing,
-        "total": sum(r["members"] for r in rows), "totals": totals,
-        "has_approx": any(r["deltas"][d][1] for r in rows for d in DELTA_PERIODS),
-    }
+    return totals
+
+
+def _fmt_totals(totals: dict) -> str:
+    return " / ".join(_fmt_delta(*totals[d]) for d in DELTA_PERIODS)
 
 
 def _fmt_int(n: int) -> str:
@@ -157,7 +198,8 @@ def summary_lines(data: dict) -> list[str]:
     totals = " · ".join(f"{d} дн: {_fmt_delta(*data['totals'][d])}" for d in DELTA_PERIODS)
     return [
         f"Метрика групп · {datetime.fromtimestamp(data['now'], MOSCOW_TZ):%d.%m.%Y %H:%M} МСК",
-        f"Групп: {data['groups']} · подписчиков всего: {_fmt_int(data['total'])}",
+        f"Аккаунтов: {len(data['accounts'])} · групп: {data['groups']} · "
+        f"подписчиков всего: {_fmt_int(data['total'])}",
         f"Прирост · {totals}",
     ]
 
@@ -169,11 +211,17 @@ def build_report(now: int | None = None) -> list[str]:
         return ["Пока ни у одного пользователя нет групп."]
     names = data["names"]
     head = summary_lines(data)
-    lines = ["📊 " + head[0], *head[1:], ""]
-    for i, r in enumerate(data["rows"], 1):
-        d = " / ".join(_fmt_delta(*r["deltas"][p]) for p in DELTA_PERIODS)
-        lines.append(f"{i}. {r['name']} (id {r['gid']})")
-        lines.append(f"    👥 {_fmt_int(r['members'])} · Δ 1/7/30 дн: {d} · постов за 7 дн: {r['posts']}")
+    lines = ["📊 " + head[0], *head[1:]]
+    for acc in data["accounts"]:
+        lines.append("")
+        lines.append(f"👤 {acc['name']} — групп: {acc['groups']} · "
+                     f"👥 {_fmt_int(acc['total'])} · Δ 1/7/30 дн: {_fmt_totals(acc['totals'])}")
+        for i, r in enumerate(acc["rows"], 1):
+            d = " / ".join(_fmt_delta(*r["deltas"][p]) for p in DELTA_PERIODS)
+            lines.append(f"{i}. {r['name']} (id {r['gid']})")
+            lines.append(f"    👥 {_fmt_int(r['members'])} · Δ 1/7/30 дн: {d} · постов за 7 дн: {r['posts']}")
+        if not acc["rows"]:
+            lines.append("    нет данных ни по одной группе")
     if data["missing"]:
         lines.append("")
         lines.append("⚠️ Нет данных (VK не отдал число подписчиков или нет токена): "
@@ -340,15 +388,57 @@ def _pdf_title_page(plt, data: dict, chart_days: int):
     return fig
 
 
-def _pdf_table_pages(plt, data: dict):
+def _pdf_accounts_page(plt, data: dict):
+    """Сводная таблица по аккаунтам: групп, подписчиков, прирост 1/7/30 дн."""
+    cols = ["#", "Аккаунт", "Групп", "Подписчики"] + [f"Δ {d} дн" for d in DELTA_PERIODS]
+    widths = [0.04, 0.45, 0.09, 0.13] + [0.10] * len(DELTA_PERIODS)
+    accs = data["accounts"]
+    for start in range(0, max(1, len(accs)), TABLE_ROWS_PER_PAGE):
+        chunk = accs[start:start + TABLE_ROWS_PER_PAGE]
+        fig = plt.figure(figsize=A4_LANDSCAPE)
+        fig.text(0.05, 0.94, "Сводка по аккаунтам", fontsize=14, fontweight="bold")
+        ax = fig.add_axes([0.05, 0.05, 0.9, 0.85])
+        ax.axis("off")
+        cells = [[str(i), _short(a["name"], 55), str(a["groups"]), _fmt_int(a["total"])]
+                 + [_fmt_delta(*a["totals"][d]) for d in DELTA_PERIODS]
+                 for i, a in enumerate(chunk, start + 1)]
+        colors = [[_delta_color(a["totals"][d][0]) for d in DELTA_PERIODS] for a in chunk]
+        _style_table(ax.table(cellText=cells, colLabels=cols, colWidths=widths,
+                              loc="upper center", cellLoc="center"), colors, first_delta_col=4)
+        yield fig
+
+
+def _short(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _style_table(table, colors: list[list[str]], first_delta_col: int) -> None:
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.45)
+    for (row, col), cell in table.get_celld().items():
+        cell.set_edgecolor("#dddddd")
+        if row == 0:
+            cell.set_facecolor("#5b9bd5")
+            cell.set_text_props(color="white", fontweight="bold")
+            continue
+        if row % 2 == 0:
+            cell.set_facecolor("#f5f8fc")
+        if col == 1:
+            cell.set_text_props(ha="left")
+            cell._loc = "left"
+        if first_delta_col <= col < first_delta_col + len(DELTA_PERIODS):
+            cell.set_text_props(color=colors[row - 1][col - first_delta_col])
+
+
+def _pdf_table_pages(plt, rows: list[dict], heading: str = "Группы"):
     cols = ["#", "Группа", "ID", "Подписчики"] + [f"Δ {d} дн" for d in DELTA_PERIODS] + ["Постов 7 дн"]
     widths = [0.04, 0.36, 0.11, 0.11] + [0.09] * len(DELTA_PERIODS) + [0.11]
-    rows = data["rows"]
     pages = max(1, -(-len(rows) // TABLE_ROWS_PER_PAGE))
     for page in range(pages):
         chunk = rows[page * TABLE_ROWS_PER_PAGE:(page + 1) * TABLE_ROWS_PER_PAGE]
         fig = plt.figure(figsize=A4_LANDSCAPE)
-        fig.text(0.05, 0.94, f"Группы ({page + 1}/{pages})", fontsize=14, fontweight="bold")
+        fig.text(0.05, 0.94, f"{heading} ({page + 1}/{pages})", fontsize=14, fontweight="bold")
         ax = fig.add_axes([0.05, 0.05, 0.9, 0.85])
         ax.axis("off")
         if not chunk:
@@ -361,38 +451,22 @@ def _pdf_table_pages(plt, data: dict):
             cells.append([str(i), name, str(r["gid"]), _fmt_int(r["members"])]
                          + [_fmt_delta(*r["deltas"][d]) for d in DELTA_PERIODS] + [str(r["posts"])])
             colors.append([_delta_color(r["deltas"][d][0]) for d in DELTA_PERIODS])
-        table = ax.table(cellText=cells, colLabels=cols, colWidths=widths, loc="upper center",
-                         cellLoc="center")
-        table.auto_set_font_size(False)
-        table.set_fontsize(9)
-        table.scale(1, 1.45)
-        for (row, col), cell in table.get_celld().items():
-            cell.set_edgecolor("#dddddd")
-            if row == 0:
-                cell.set_facecolor("#5b9bd5")
-                cell.set_text_props(color="white", fontweight="bold")
-                continue
-            if row % 2 == 0:
-                cell.set_facecolor("#f5f8fc")
-            if col == 1:
-                cell.set_text_props(ha="left")
-                cell._loc = "left"
-            if 4 <= col < 4 + len(DELTA_PERIODS):
-                cell.set_text_props(color=colors[row - 1][col - 4])
+        _style_table(ax.table(cellText=cells, colLabels=cols, colWidths=widths,
+                              loc="upper center", cellLoc="center"), colors, first_delta_col=4)
         yield fig
 
 
-def _pdf_group_pages(plt, data: dict, chart_days: int):
-    rows = data["rows"]
+def _pdf_group_pages(plt, rows: list[dict], now: int, chart_days: int, heading: str = ""):
     for start in range(0, len(rows), GROUP_CHARTS_PER_PAGE):
         chunk = rows[start:start + GROUP_CHARTS_PER_PAGE]
         fig, axes = plt.subplots(3, 3, figsize=A4_LANDSCAPE)
-        fig.suptitle(f"Динамика по группам за {chart_days} дн", fontsize=14, fontweight="bold")
+        prefix = f"{_short(heading, 60)}: " if heading else ""
+        fig.suptitle(f"{prefix}динамика по группам за {chart_days} дн", fontsize=14, fontweight="bold")
         for ax, r in zip(axes.flat, chunk):
             name = r["name"] if len(r["name"]) <= 32 else r["name"][:31] + "…"
             ax.set_title(f"{name}\n{_fmt_int(r['members'])} · Δ7: {_fmt_delta(*r['deltas'][7])}",
                          fontsize=9)
-            points = daily_totals(chart_days, data["now"], [r["gid"]])
+            points = daily_totals(chart_days, now, [r["gid"]])
             if len(points) < 2:
                 ax.text(0.5, 0.5, "мало данных", ha="center", va="center",
                         transform=ax.transAxes, color="#888888")
@@ -419,7 +493,8 @@ def _pdf_group_pages(plt, data: dict, chart_days: int):
 
 
 def build_pdf(now: int | None = None, chart_days: int = 30) -> bytes | None:
-    """PDF-отчёт: сводка + общий график, таблица всех групп, мини-графики по группам.
+    """PDF-отчёт: сводка + общий график, сводка по аккаунтам, затем по каждому
+    аккаунту — таблица его групп и мини-графики.
 
     None — если групп нет совсем.
     """
@@ -429,11 +504,18 @@ def build_pdf(now: int | None = None, chart_days: int = 30) -> bytes | None:
     plt = _plt()
     from matplotlib.backends.backend_pdf import PdfPages
 
+    def pages():
+        yield _pdf_title_page(plt, data, chart_days)
+        yield from _pdf_accounts_page(plt, data)
+        for acc in data["accounts"]:
+            heading = (f"{acc['name']} · групп: {acc['groups']} · "
+                       f"подписчиков: {_fmt_int(acc['total'])}")
+            yield from _pdf_table_pages(plt, acc["rows"], _short(heading, 90))
+            yield from _pdf_group_pages(plt, acc["rows"], data["now"], chart_days, acc["name"])
+
     buf = BytesIO()
     with PdfPages(buf, metadata={"Title": "Метрика групп VK", "Author": "baideromega"}) as pdf:
-        for fig in (_pdf_title_page(plt, data, chart_days),
-                    *_pdf_table_pages(plt, data),
-                    *_pdf_group_pages(plt, data, chart_days)):
+        for fig in pages():
             pdf.savefig(fig)
             plt.close(fig)
     buf.seek(0)

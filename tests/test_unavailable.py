@@ -121,3 +121,41 @@ def test_network_error_is_not_replaced(user_group_source, tmp_path, monkeypatch)
 
     assert not db.get_unavailable_ids()
     assert not db.get_scheduled_posts() and not ctx.job_queue.jobs
+
+@pytest.fixture(autouse=True)
+def _reset_streak():
+    scheduler._dead_streak.clear()
+    yield
+    scheduler._dead_streak.clear()
+
+
+def test_tiktok_block_expires(monkeypatch):
+    db.mark_unavailable("v1", downloader.TIKTOK_BLOCKED_REASON, ttl_seconds=100)
+    db.mark_unavailable("v2", "Video unavailable")
+    assert db.get_unavailable_ids() == {"v1", "v2"}
+    now = db.time.time()
+    monkeypatch.setattr(db.time, "time", lambda: now + 101)
+    assert db.get_unavailable_ids() == {"v2"}   # временная пометка снялась, вечная — нет
+
+
+def test_replacement_chain_stops_after_limit(user_group_source, tmp_path, monkeypatch):
+    rid = _make_rule_with_source(user_group_source, str(tmp_path), n_videos=6)
+    post_id = _queue_first_video(rid)
+    monkeypatch.setattr(downloader, "DOWNLOAD_PROXY", "socks5h://xray:1080")
+
+    async def dead(url, token):
+        raise RuntimeError(BLOCKED)
+
+    monkeypatch.setattr(scheduler, "_download", dead)
+    sent = []
+    for _ in range(scheduler.MAX_REPLACEMENTS_IN_ROW + 1):
+        ctx = _Ctx(post_id)
+        asyncio.run(scheduler._publish_job(ctx))
+        sent += ctx.bot.sent
+        queued = db.get_scheduled_posts()
+        post_id = queued[0]["id"] if queued else None
+
+    assert post_id is None                                   # цепочка оборвалась
+    assert len(sent) == scheduler.MAX_REPLACEMENTS_IN_ROW + 1
+    assert "Замены остановил" in sent[-1]
+    assert len(db.get_unavailable_ids()) == scheduler.MAX_REPLACEMENTS_IN_ROW + 1

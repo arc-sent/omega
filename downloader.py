@@ -229,13 +229,16 @@ _UNAVAILABLE_MARKERS = (
 # TikTok (статус 10204) отвечает так и на удалённый, и на закрытый по региону пост. Насовсем
 # считаем, только если уже пробовали через прокси, иначе прокси мог бы помочь.
 _TIKTOK_BLOCKED_MARKER = "Your IP address is blocked from accessing this post"
+# Тот же ответ TikTok шлёт подряд на все ролики аккаунта, закрытого для региона, или когда
+# блокирует сам IP, — поэтому такая причина временная (см. scheduler.UNAVAILABLE_RETRY_DAYS).
+TIKTOK_BLOCKED_REASON = "TikTok не отдаёт пост (удалён или закрыт для региона)"
 
 
 def unavailable_reason(exc: BaseException) -> str | None:
-    """Причина, если ошибка скачивания означает «ролик недоступен насовсем», иначе None."""
+    """Причина, если ошибка скачивания означает «ролик недоступен», иначе None."""
     text = str(exc)
     if _TIKTOK_BLOCKED_MARKER in text:
-        return "TikTok не отдаёт пост (удалён или закрыт для региона)" if DOWNLOAD_PROXY else None
+        return TIKTOK_BLOCKED_REASON if DOWNLOAD_PROXY else None
     for marker in _UNAVAILABLE_MARKERS:
         if marker in text:
             return marker

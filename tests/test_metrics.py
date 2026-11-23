@@ -144,8 +144,51 @@ def test_build_pdf_renders_all_pages():
                              captured_at=NOW - d * DAY)
     pdf = metrics.build_pdf(NOW)
     assert pdf.startswith(b"%PDF")
-    # титул + 1 страница таблицы + 2 страницы мини-графиков (12 групп по 9)
-    assert len(re.findall(rb"/Type\s*/Page(?!s)", pdf)) == 4
+    # титул + сводка по аккаунтам + 1 страница таблицы + 2 страницы мини-графиков (12 по 9)
+    assert len(re.findall(rb"/Type\s*/Page(?!s)", pdf)) == 5
+
+
+def _account(tid, name, groups):
+    aid = db.add_account(tid, name, TOKEN)
+    for gid, gname in groups:
+        db.add_group(tid, vk_group_id=gid, name=gname, account_id=aid)
+    return aid
+
+
+def test_report_split_by_accounts():
+    """Несколько аккаунтов (у одного и у разных юзеров) — отдельные разделы с итогами."""
+    db.ensure_user(1)
+    db.ensure_user(2)
+    _account(1, "Первый", [(10, "A"), (20, "B")])
+    _account(1, "Второй", [(30, "C")])
+    _account(2, "Чужой", [(40, "D")])
+    db.add_group_metrics([(10, 100, ""), (20, 50, ""), (30, 7, ""), (40, 1000, "")],
+                         captured_at=NOW - 2 * DAY)
+    db.add_group_metrics([(10, 110, ""), (20, 55, ""), (30, 9, ""), (40, 1000, "")],
+                         captured_at=NOW)
+    data = metrics.report_data(NOW)
+    accs = {a["name"]: a for a in data["accounts"]}
+    assert set(accs) == {"Первый · tg 1", "Второй · tg 1", "Чужой · tg 2"}
+    assert accs["Первый · tg 1"]["total"] == 165
+    assert accs["Первый · tg 1"]["totals"][1] == (15, False)
+    assert [r["gid"] for r in accs["Первый · tg 1"]["rows"]] == [10, 20]
+    assert accs["Второй · tg 1"]["total"] == 9
+    assert data["total"] == 1174
+    text = "\n".join(metrics.build_report(NOW))
+    assert "Аккаунтов: 3" in text
+    assert text.index("Первый") < text.index("Второй") < text.index("Чужой")
+
+
+def test_build_pdf_has_pages_per_account():
+    pytest.importorskip("matplotlib")
+    db.ensure_user(1)
+    _account(1, "Первый", [(10, "A")])
+    _account(1, "Второй", [(20, "B")])
+    for d in (1, 0):
+        db.add_group_metrics([(10, 100 + d, ""), (20, 200 + d, "")], captured_at=NOW - d * DAY)
+    pdf = metrics.build_pdf(NOW)
+    # титул + сводка + (таблица + мини-графики) × 2 аккаунта
+    assert len(re.findall(rb"/Type\s*/Page(?!s)", pdf)) == 6
 
 
 def test_build_pdf_none_without_groups():

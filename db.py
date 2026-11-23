@@ -146,7 +146,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS unavailable_videos (
                 tt_video_id TEXT PRIMARY KEY,
                 reason      TEXT,
-                marked_at   INTEGER NOT NULL
+                marked_at   INTEGER NOT NULL,
+                expires_at  INTEGER             -- NULL — насовсем
             );
 
             CREATE TABLE IF NOT EXISTS error_logs (
@@ -243,6 +244,13 @@ def init_db() -> None:
                 "ALTER TABLE vk_groups ADD COLUMN account_id INTEGER "
                 "REFERENCES vk_accounts(id) ON DELETE SET NULL"
             )
+
+        # Срок у недоступных роликов. Старые пометки «TikTok не отдаёт пост» ставились
+        # цепочкой замен на весь аккаунт разом — их снимаем, пусть ролики вернутся в план.
+        un_cols = {row[1] for row in conn.execute("PRAGMA table_info(unavailable_videos)")}
+        if "expires_at" not in un_cols:
+            conn.execute("ALTER TABLE unavailable_videos ADD COLUMN expires_at INTEGER")
+            conn.execute("DELETE FROM unavailable_videos WHERE reason LIKE 'TikTok %'")
 
         sp_cols = {row[1] for row in conn.execute("PRAGMA table_info(scheduled_posts)")}
         if "account_id" not in sp_cols:
@@ -653,18 +661,24 @@ def mark_published(rule_id: int, tt_video_id: str) -> None:
 
 # ─── Недоступные ролики ───────────────────────────────────────────────────────
 
-def mark_unavailable(tt_video_id: str, reason: str) -> None:
+def mark_unavailable(tt_video_id: str, reason: str, ttl_seconds: int | None = None) -> None:
+    """ttl_seconds=None — насовсем, иначе ролик вернётся в план через ttl_seconds."""
+    now = int(time.time())
+    expires_at = now + ttl_seconds if ttl_seconds else None
     with _connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO unavailable_videos (tt_video_id, reason, marked_at) "
-            "VALUES (?, ?, ?)",
-            (tt_video_id, reason, int(time.time())),
+            "INSERT OR REPLACE INTO unavailable_videos (tt_video_id, reason, marked_at, expires_at) "
+            "VALUES (?, ?, ?, ?)",
+            (tt_video_id, reason, now, expires_at),
         )
 
 
 def get_unavailable_ids() -> set[str]:
     with _connect() as conn:
-        rows = conn.execute("SELECT tt_video_id FROM unavailable_videos").fetchall()
+        rows = conn.execute(
+            "SELECT tt_video_id FROM unavailable_videos "
+            "WHERE expires_at IS NULL OR expires_at > ?", (int(time.time()),)
+        ).fetchall()
     return {r["tt_video_id"] for r in rows}
 
 
@@ -929,8 +943,10 @@ def get_all_groups_for_metrics() -> list[sqlite3.Row]:
     with _connect() as conn:
         return conn.execute(
             """
-            SELECT g.vk_group_id, g.name, g.telegram_id, g.account_id
+            SELECT g.vk_group_id, g.name, g.telegram_id, g.account_id,
+                   a.name AS account_name
             FROM vk_groups g
+            LEFT JOIN vk_accounts a ON a.id = g.account_id
             ORDER BY g.vk_group_id, g.id
             """
         ).fetchall()

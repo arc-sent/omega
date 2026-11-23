@@ -20,7 +20,7 @@ import db
 import video_processor
 from downloader import (
     detect_platform, download_tiktok, download_likee, download_youtube, download_vk,
-    unavailable_reason,
+    unavailable_reason, TIKTOK_BLOCKED_REASON,
 )
 from vk import VKError, VK_RETRYABLE_ERROR_CODES, upload_to_vk
 
@@ -41,6 +41,13 @@ DAILY_PLAN_MINUTE = int(os.getenv("DAILY_PLAN_MINUTE", "5"))
 PUBLISH_PAUSE_RECHECK_SECONDS = int(os.getenv("PUBLISH_PAUSE_RECHECK_SECONDS", "60"))
 # Ролик оказался недоступен насовсем — через столько секунд пробуем следующий того же правила.
 REPLACEMENT_DELAY_SECONDS = 60
+# Больше стольких замен подряд по одному правилу не ставим: если не скачиваются все ролики
+# подряд, дело не в роликах (аккаунт закрыт для региона, TikTok режет IP), и цепочка
+# только выжигала бы источник и сыпала ошибками. Сбрасывается первой удачной публикацией.
+MAX_REPLACEMENTS_IN_ROW = 2
+# «TikTok не отдаёт пост» бывает и временным — такой ролик вернётся в план через N дней.
+UNAVAILABLE_RETRY_DAYS = 7
+_dead_streak: dict[int, int] = {}
 # Автодопарсинг истории: держим запас невыложенных кандидатов на столько дневных
 # норм вперёд; если меньше — углубляемся в историю (не больше N проходов за раз).
 BACKLOG_DAYS = int(os.getenv("BACKLOG_DAYS", "3"))
@@ -642,6 +649,7 @@ async def _publish_job(context) -> None:
                              title, sent_description)
 
         db.mark_published(rule_id, post["tt_video_id"])
+        _dead_streak.pop(rule_id, None)
         # Диагностика описания: показываем владельцу, что реально ушло в VK как
         # описание для КАЖДОГО ролика (чтобы отличить потерю на нашей стороне от
         # того, что VK не показал текст). Можно убрать после разбора.
@@ -664,9 +672,23 @@ async def _publish_job(context) -> None:
         reason = unavailable_reason(exc)
         skip_note = ""
         if reason:
-            db.mark_unavailable(post["tt_video_id"], reason)
-            skip_note = "\n⏭ Ролик недоступен — больше не ставлю его в план."
-            replacement = schedule_replacement(context.job_queue, rule_id)
+            if reason == TIKTOK_BLOCKED_REASON:
+                db.mark_unavailable(post["tt_video_id"], reason,
+                                    ttl_seconds=UNAVAILABLE_RETRY_DAYS * 86400)
+                skip_note = (f"\n⏭ Ролик недоступен — отложил его на "
+                             f"{UNAVAILABLE_RETRY_DAYS} дн.")
+            else:
+                db.mark_unavailable(post["tt_video_id"], reason)
+                skip_note = "\n⏭ Ролик недоступен — больше не ставлю его в план."
+            streak = _dead_streak.get(rule_id, 0) + 1
+            _dead_streak[rule_id] = streak
+            replacement = None
+            if streak <= MAX_REPLACEMENTS_IN_ROW:
+                replacement = schedule_replacement(context.job_queue, rule_id)
+            elif streak == MAX_REPLACEMENTS_IN_ROW + 1:
+                skip_note += (f"\n🛑 Уже {streak} ролика подряд не скачиваются — похоже, "
+                              f"TikTok закрыл аккаунт или блокирует IP. Замены остановил, "
+                              f"дальше — только по расписанию.")
             if replacement:
                 skip_note += (f"\n🔁 Вместо него через {REPLACEMENT_DELAY_SECONDS} с "
                               f"выложу следующий: {replacement}")
