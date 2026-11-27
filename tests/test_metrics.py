@@ -13,6 +13,12 @@ DAY = 86400
 NOW = 1_760_000_000
 
 
+@pytest.fixture(autouse=True)
+def _no_managed_groups(monkeypatch):
+    """По умолчанию groups.get ничего не отдаёт — тесты не ходят в сеть."""
+    monkeypatch.setattr(metrics, "fetch_managed_groups", lambda token: {})
+
+
 def _user(tid, groups):
     db.ensure_user(tid)
     aid = db.add_account(tid, "Акк", TOKEN)
@@ -31,7 +37,7 @@ def test_collect_snapshot_saves_counts(monkeypatch):
 
     monkeypatch.setattr(metrics, "fetch_groups_members", fake)
     res = metrics.collect_snapshot()
-    assert res == {"saved": 1, "total": 2, "failed": [20]}
+    assert res == {"saved": 1, "total": 2, "failed": [20], "accounts_failed": []}
     assert calls == [[10, 20]]
     assert [r["members_count"] for r in db.get_group_metrics(10)] == [100]
     assert db.get_group_metrics(20) == []
@@ -213,3 +219,96 @@ def test_fetch_groups_members_keeps_token_out_of_url(monkeypatch):
     assert vk.fetch_groups_members("vk1.a.secret", [1]) == {1: (5, "g")}
     assert seen["data"]["access_token"] == "vk1.a.secret"
     assert "secret" not in seen["url"] and not seen["params"]
+
+
+# ─── Все группы под управлением аккаунта (groups.get) ─────────────────────────
+
+def test_fetch_managed_groups_pages_and_parses(monkeypatch):
+    import vk
+
+    pages = [
+        {"response": {"count": 3, "items": [{"id": 1, "members_count": 10, "name": "a"},
+                                            {"id": 2, "members_count": 20, "name": "b"}]}},
+        {"response": {"count": 3, "items": [{"id": 3, "name": "c"}]}},  # без members_count
+    ]
+    seen = []
+
+    class R:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    def fake_post(url, data=None, **kw):
+        seen.append((url, dict(data)))
+        return R(pages[len(seen) - 1])
+
+    monkeypatch.setattr(vk.requests, "post", fake_post)
+    assert vk.fetch_managed_groups("vk1.a.secret") == {1: (10, "a"), 2: (20, "b"), 3: (None, "c")}
+    assert [d["offset"] for _, d in seen] == [0, 2]
+    assert seen[0][0].endswith("/groups.get") and seen[0][1]["filter"] == "admin,editor,moder"
+    assert all("secret" not in url for url, _ in seen)
+
+
+def test_snapshot_includes_managed_groups(monkeypatch):
+    """groups.get даёт и список, и подписчиков: группы из бота, уже пришедшие так,
+    повторно через getById не запрашиваются."""
+    aid = _user(1, [(10, "A")])
+    monkeypatch.setattr(metrics, "fetch_managed_groups",
+                        lambda token: {10: (100, "A vk"), 77: (7000, "Чужая")})
+    calls = []
+    monkeypatch.setattr(metrics, "fetch_groups_members",
+                        lambda token, ids: calls.append(ids) or {})
+    res = metrics.collect_snapshot()
+    assert res["saved"] == 2 and res["total"] == 2 and res["failed"] == []
+    assert calls == []
+    assert [r["vk_group_id"] for r in db.get_managed_groups_for_metrics()] == [10, 77]
+    assert db.get_managed_groups_for_metrics()[0]["account_id"] == aid
+    assert [r["members_count"] for r in db.get_group_metrics(77)] == [7000]
+
+
+def test_managed_groups_failure_keeps_old_list(monkeypatch):
+    aid = _user(1, [(10, "A")])
+    db.set_managed_groups(aid, [(77, "Чужая")])
+
+    def boom(token):
+        raise VKError(15, "Access denied: no access to call this method")
+
+    monkeypatch.setattr(metrics, "fetch_managed_groups", boom)
+    monkeypatch.setattr(metrics, "fetch_groups_members", lambda token, ids: {g: (5, "") for g in ids})
+    res = metrics.collect_snapshot()
+    assert res["accounts_failed"] == [aid]
+    assert [r["vk_group_id"] for r in db.get_managed_groups_for_metrics()] == [77]
+    assert res["saved"] == 2  # группы бота и прежнего списка сняты через getById
+
+
+def test_report_scope_bot_vs_all():
+    aid = _user(1, [(10, "Из бота")])
+    db.set_managed_groups(aid, [(10, "Из бота vk"), (77, "Только под управлением")])
+    db.add_group_metrics([(10, 100, ""), (77, 5000, "")], captured_at=NOW)
+
+    bot_data = metrics.report_data(NOW, metrics.SCOPE_BOT)
+    assert [r["gid"] for r in bot_data["rows"]] == [10] and bot_data["total"] == 100
+
+    all_data = metrics.report_data(NOW, metrics.SCOPE_ALL)
+    assert [r["gid"] for r in all_data["rows"]] == [77, 10] and all_data["total"] == 5100
+    assert {r["gid"]: r["in_bot"] for r in all_data["rows"]} == {77: False, 10: True}
+    (acc,) = all_data["accounts"]
+    assert acc["groups"] == 2 and acc["total"] == 5100
+    assert all_data["names"][10] == "Из бота"  # имя из бота приоритетнее имени из VK
+
+    text = "\n".join(metrics.build_report(NOW, metrics.SCOPE_ALL))
+    assert "все группы аккаунтов" in text and "Только под управлением (id 77) · вне бота" in text
+    assert "вне бота" not in "\n".join(metrics.build_report(NOW, metrics.SCOPE_BOT))
+
+
+def test_build_pdf_all_scope():
+    pytest.importorskip("matplotlib")
+    aid = _user(1, [(10, "A")])
+    db.set_managed_groups(aid, [(77, "B")])
+    for d in (1, 0):
+        db.add_group_metrics([(10, 100 + d, ""), (77, 200 + d, "")], captured_at=NOW - d * DAY)
+    pdf = metrics.build_pdf(NOW, scope=metrics.SCOPE_ALL)
+    assert pdf.startswith(b"%PDF")
+    assert metrics.pdf_filename(NOW, metrics.SCOPE_ALL).startswith("metrics_all_")

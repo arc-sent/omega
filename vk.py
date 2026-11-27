@@ -164,6 +164,47 @@ def fetch_groups_members(vk_token: str, group_ids: list[int]) -> dict[int, tuple
     return result
 
 
+# groups.get отдаёт до 1000 групп за вызов; дальше — по offset.
+_MANAGED_BATCH = 1000
+
+
+def fetch_managed_groups(vk_token: str) -> dict[int, tuple[int | None, str]]:
+    """Все сообщества, где владелец токена админ, редактор или модератор:
+    {group_id: (members_count, name)}.
+
+    groups.get filter=admin,editor,moder — нужен пользовательский токен с правом
+    groups. Бросает VKError при ошибке API (например, нет прав — код 15/7).
+    """
+    result: dict[int, tuple[int | None, str]] = {}
+    offset = 0
+    while True:
+        try:
+            # POST с телом, а не GET: токен не попадёт в текст сетевой ошибки.
+            resp = requests.post(
+                "https://api.vk.com/method/groups.get",
+                data={"access_token": vk_token, "v": VK_API_VERSION, "extended": 1,
+                      "filter": "admin,editor,moder", "fields": "members_count",
+                      "count": _MANAGED_BATCH, "offset": offset},
+                timeout=20,
+            ).json()
+        except Exception as exc:
+            raise VKError(None, f"groups.get: {exc}", stage="метрика", network=True) from exc
+        if "error" in resp:
+            err = resp["error"]
+            raise VKError(err.get("error_code"), err.get("error_msg", "groups.get"),
+                          stage="метрика")
+        response = resp.get("response") or {}
+        items = response.get("items") or []
+        for g in items:
+            try:
+                result[int(g["id"])] = (g.get("members_count"), g.get("name") or "")
+            except (KeyError, TypeError, ValueError):
+                continue
+        offset += len(items)
+        if not items or offset >= int(response.get("count") or 0):
+            return result
+
+
 # ─── Публикация ───────────────────────────────────────────────────────────────
 
 def upload_to_vk(

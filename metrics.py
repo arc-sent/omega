@@ -3,8 +3,11 @@
 Отчёт отдаётся PDF-файлом (build_pdf): сводка и общий график, сводка по VK-аккаунтам,
 затем по каждому аккаунту — таблица его групп и мини-графики. Рисуется matplotlib (PdfPages) — без доп. зависимостей.
 
-Снимок — число подписчиков каждой группы всех пользователей на момент вызова
-(groups.getById, fields=members_count). Снимки пишутся в db.group_metrics:
+Два режима отчёта (scope): «группы из бота» (vk_groups) и «все группы аккаунтов» —
+плюс сообщества, где VK-аккаунт админ/редактор/модератор (groups.get).
+
+Снимок — число подписчиков на момент вызова: сообщества под управлением аккаунтов
+(groups.get) и группы из бота (groups.getById, fields=members_count). Снимки пишутся в db.group_metrics:
 раз в сутки джобом (METRICS_HOUR:METRICS_MINUTE МСК) и при каждом /metrics.
 Прирост за N дней = текущее − последний снимок не позже «сейчас − N дней»; если
 такого ещё нет (отслеживание началось позже), берётся первый снимок группы и
@@ -19,7 +22,7 @@ from io import BytesIO
 import pytz
 
 import db
-from vk import VKError, fetch_groups_members
+from vk import VKError, fetch_groups_members, fetch_managed_groups
 
 logger = logging.getLogger(__name__)
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
@@ -31,24 +34,55 @@ CHART_PERIODS = (7, 30, 90)
 
 # ─── Сбор снимка ──────────────────────────────────────────────────────────────
 
-def _group_candidates() -> tuple[dict[int, list[int]], dict[int, str]]:
-    """{vk_group_id: [account_id, ...]} и {vk_group_id: имя из бота}.
+# Какие группы входят в отчёт: добавленные в бота или все под управлением аккаунтов.
+SCOPE_BOT = "bot"
+SCOPE_ALL = "all"
+SCOPES = (SCOPE_BOT, SCOPE_ALL)
+SCOPE_TITLES = {SCOPE_BOT: "группы из бота", SCOPE_ALL: "все группы аккаунтов"}
+
+
+def _group_rows(scope: str = SCOPE_BOT) -> list[dict]:
+    """Строки «группа ↔ аккаунт» для отчёта.
+
+    bot — группы, добавленные пользователями в бота (vk_groups). all — они же плюс
+    сообщества, где аккаунт админ/редактор/модератор (account_managed_groups, список
+    обновляется при каждом снимке). Имя из бота приоритетнее имени из VK.
+    """
+    rows = [{"vk_group_id": abs(int(g["vk_group_id"])), "name": g["name"],
+             "telegram_id": g["telegram_id"], "account_id": g["account_id"],
+             "account_name": g["account_name"]}
+            for g in db.get_all_groups_for_metrics()]
+    if scope == SCOPE_ALL:
+        rows += [{"vk_group_id": abs(int(g["vk_group_id"])), "name": g["name"],
+                  "telegram_id": g["telegram_id"], "account_id": g["account_id"],
+                  "account_name": g["account_name"]}
+                 for g in db.get_managed_groups_for_metrics()]
+    return rows
+
+
+def _bot_group_ids() -> set[int]:
+    return {abs(int(g["vk_group_id"])) for g in db.get_all_groups_for_metrics()}
+
+
+def _group_candidates(scope: str = SCOPE_BOT) -> tuple[dict[int, list[int]], dict[int, str]]:
+    """{vk_group_id: [account_id, ...]} и {vk_group_id: имя}.
 
     Одна VK-группа может быть у нескольких пользователей — запрашиваем её один раз,
     а их аккаунты служат запасными токенами, если первый не сработает.
     """
     cands: dict[int, list[int]] = {}
     names: dict[int, str] = {}
-    for g in db.get_all_groups_for_metrics():
-        gid = abs(int(g["vk_group_id"]))
-        names.setdefault(gid, g["name"])
+    for g in _group_rows(scope):
+        gid = g["vk_group_id"]
+        if g["name"]:
+            names.setdefault(gid, g["name"])
         lst = cands.setdefault(gid, [])
         if g["account_id"] is not None and g["account_id"] not in lst:
             lst.append(g["account_id"])
     return cands, names
 
 
-def _accounts() -> list[dict]:
+def _accounts(scope: str = SCOPE_BOT) -> list[dict]:
     """VK-аккаунты всех пользователей с их группами (для разбивки отчёта).
 
     [{"name": "Основной · tg 123", "gids": [vk_group_id, ...]}, ...] — по владельцу и
@@ -56,8 +90,8 @@ def _accounts() -> list[dict]:
     аккаунта (account_id NULL) собираются в «Без аккаунта» своего владельца.
     """
     accs: dict[tuple, dict] = {}
-    for g in db.get_all_groups_for_metrics():
-        gid = abs(int(g["vk_group_id"]))
+    for g in _group_rows(scope):
+        gid = g["vk_group_id"]
         aid = g["account_id"]
         key = (g["telegram_id"], aid if aid is not None else -1)
         acc = accs.get(key)
@@ -72,14 +106,34 @@ def _accounts() -> list[dict]:
 def collect_snapshot() -> dict:
     """Снять число подписчиков всех групп и записать в базу (блокирующий вызов).
 
-    Группы раскладываются по токенам их владельцев; если запрос с токеном упал,
-    группы пробуются со следующим аккаунтом из кандидатов. Возвращает
-    {"saved": N, "total": M, "failed": [vk_group_id, ...]}.
+    1) По каждому аккаунту — groups.get (сообщества под его управлением): обновляет
+       account_managed_groups и сразу даёт число подписчиков. Ошибка аккаунта (нет
+       права groups, токен протух) не срывает снимок — его список остаётся прежним.
+    2) Группы из бота, которых не было в ответах, — groups.getById по токенам их
+       владельцев; если запрос с токеном упал, пробуется следующий аккаунт.
+    Возвращает {"saved", "total", "failed": [vk_group_id], "accounts_failed": [account_id]}.
     """
-    cands, names = _group_candidates()
     tokens: dict[int, str | None] = {}
     got: dict[int, tuple[int, str]] = {}
-    pending = {gid: list(accs) for gid, accs in cands.items()}
+    accounts_failed = []
+    for acc in db.get_all_accounts_for_metrics():
+        aid = acc["id"]
+        tokens[aid] = db.get_vk_token_by_account(aid)
+        if not tokens[aid]:
+            continue
+        try:
+            managed = fetch_managed_groups(tokens[aid])
+        except VKError as exc:
+            logger.warning("Метрика: groups.get для аккаунта %s — %s", aid, exc)
+            accounts_failed.append(aid)
+            continue
+        db.set_managed_groups(aid, [(gid, name) for gid, (_, name) in managed.items()])
+        for gid, (count, name) in managed.items():
+            if count is not None:
+                got[gid] = (count, name)
+
+    cands, names = _group_candidates(SCOPE_ALL)
+    pending = {gid: list(accs) for gid, accs in cands.items() if gid not in got}
     while pending:
         by_account: dict[int, list[int]] = {}
         for gid, accs in list(pending.items()):
@@ -108,8 +162,11 @@ def collect_snapshot() -> dict:
 
     db.add_group_metrics([(gid, cnt, name) for gid, (cnt, name) in got.items()])
     failed = sorted(set(cands) - set(got))
-    logger.info("Метрика: снято %s из %s групп, не удалось: %s", len(got), len(cands), failed)
-    return {"saved": len(got), "total": len(cands), "failed": failed}
+    total = len(set(cands) | set(got))
+    logger.info("Метрика: снято %s из %s групп, не удалось: %s; groups.get упал у аккаунтов %s",
+                len(got), total, failed, accounts_failed)
+    return {"saved": len(got), "total": total, "failed": failed,
+            "accounts_failed": accounts_failed}
 
 
 def last_snapshot_age(now: int | None = None) -> int | None:
@@ -139,10 +196,14 @@ def _fmt_delta(value: int | None, approx: bool) -> str:
     return f"{value:+d}" + ("*" if approx else "")
 
 
-def report_data(now: int | None = None) -> dict:
-    """Данные отчёта: строки по группам (крупные сверху), итоги, группы без данных."""
+def report_data(now: int | None = None, scope: str = SCOPE_BOT) -> dict:
+    """Данные отчёта: строки по группам (крупные сверху), итоги, группы без данных.
+
+    scope — bot (группы из бота) или all (плюс все сообщества под управлением аккаунтов).
+    """
     now = int(now if now is not None else time.time())
-    cands, names = _group_candidates()
+    cands, names = _group_candidates(scope)
+    in_bot = _bot_group_ids()
     rows, missing = [], []
     for gid in cands:
         latest = db.get_latest_metric_before(gid, now)
@@ -156,11 +217,12 @@ def report_data(now: int | None = None) -> dict:
             "members": cur,
             "deltas": {d: _delta(gid, cur, now, d) for d in DELTA_PERIODS},
             "posts": db.count_published_to_vk_group(gid, now - 7 * DAY, now + 1),
+            "in_bot": gid in in_bot,
         })
     rows.sort(key=lambda r: r["members"], reverse=True)
     by_gid = {r["gid"]: r for r in rows}
     accounts = []
-    for acc in _accounts():
+    for acc in _accounts(scope):
         acc_rows = [by_gid[g] for g in acc["gids"] if g in by_gid]
         acc_rows.sort(key=lambda r: r["members"], reverse=True)
         accounts.append({
@@ -169,7 +231,8 @@ def report_data(now: int | None = None) -> dict:
             "total": sum(r["members"] for r in acc_rows), "totals": _sum_deltas(acc_rows),
         })
     return {
-        "now": now, "names": names, "groups": len(cands), "rows": rows, "missing": missing,
+        "now": now, "scope": scope, "names": names, "groups": len(cands), "rows": rows,
+        "missing": missing,
         "total": sum(r["members"] for r in rows), "totals": _sum_deltas(rows),
         "accounts": accounts,
         "has_approx": any(r["deltas"][d][1] for r in rows for d in DELTA_PERIODS),
@@ -197,16 +260,17 @@ def summary_lines(data: dict) -> list[str]:
     """Шапка отчёта: дата, число групп, подписчики, прирост (без эмодзи — идёт и в PDF)."""
     totals = " · ".join(f"{d} дн: {_fmt_delta(*data['totals'][d])}" for d in DELTA_PERIODS)
     return [
-        f"Метрика групп · {datetime.fromtimestamp(data['now'], MOSCOW_TZ):%d.%m.%Y %H:%M} МСК",
+        f"Метрика групп ({SCOPE_TITLES[data.get('scope', SCOPE_BOT)]}) · "
+        f"{datetime.fromtimestamp(data['now'], MOSCOW_TZ):%d.%m.%Y %H:%M} МСК",
         f"Аккаунтов: {len(data['accounts'])} · групп: {data['groups']} · "
         f"подписчиков всего: {_fmt_int(data['total'])}",
         f"Прирост · {totals}",
     ]
 
 
-def build_report(now: int | None = None) -> list[str]:
+def build_report(now: int | None = None, scope: str = SCOPE_BOT) -> list[str]:
     """Текст отчёта по всем группам (список строк; самые большие группы сверху)."""
-    data = report_data(now)
+    data = report_data(now, scope)
     if not data["groups"]:
         return ["Пока ни у одного пользователя нет групп."]
     names = data["names"]
@@ -218,7 +282,8 @@ def build_report(now: int | None = None) -> list[str]:
                      f"👥 {_fmt_int(acc['total'])} · Δ 1/7/30 дн: {_fmt_totals(acc['totals'])}")
         for i, r in enumerate(acc["rows"], 1):
             d = " / ".join(_fmt_delta(*r["deltas"][p]) for p in DELTA_PERIODS)
-            lines.append(f"{i}. {r['name']} (id {r['gid']})")
+            mark = "" if r["in_bot"] or scope == SCOPE_BOT else " · вне бота"
+            lines.append(f"{i}. {r['name']} (id {r['gid']}){mark}")
             lines.append(f"    👥 {_fmt_int(r['members'])} · Δ 1/7/30 дн: {d} · постов за 7 дн: {r['posts']}")
         if not acc["rows"]:
             lines.append("    нет данных ни по одной группе")
@@ -247,8 +312,8 @@ def split_messages(lines: list[str], limit: int = 4000) -> list[str]:
 
 # ─── График ───────────────────────────────────────────────────────────────────
 
-def daily_series(days: int, now: int | None = None,
-                 group_ids: list[int] | None = None) -> list[tuple[datetime, int, int]]:
+def daily_series(days: int, now: int | None = None, group_ids: list[int] | None = None,
+                 scope: str = SCOPE_BOT) -> list[tuple[datetime, int, int]]:
     """(день, подписчиков на конец дня, прирост за день) за последние days дней.
 
     На каждый день берётся последний снимок группы не позже конца дня (дни без
@@ -259,7 +324,7 @@ def daily_series(days: int, now: int | None = None,
     """
     now = int(now if now is not None else time.time())
     if group_ids is None:
-        group_ids = list(_group_candidates()[0])
+        group_ids = list(_group_candidates(scope)[0])
     history = {gid: db.get_group_metrics(gid) for gid in group_ids}
     today = datetime.fromtimestamp(now, MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     result = []
@@ -322,16 +387,17 @@ def _draw_growth(ax1, ax2, points: list[tuple[datetime, int, int]], title: str) 
         ax.spines["right"].set_visible(False)
 
 
-def build_chart(days: int, now: int | None = None, group_id: int | None = None) -> bytes | None:
+def build_chart(days: int, now: int | None = None, group_id: int | None = None,
+                scope: str = SCOPE_BOT) -> bytes | None:
     """PNG: подписчики (линия) и прирост по дням (столбцы). None — мало данных."""
-    points = daily_series(days, now, [group_id] if group_id else None)
+    points = daily_series(days, now, [group_id] if group_id else None, scope)
     if len(points) < 2:
         return None
     if group_id:
-        _, names = _group_candidates()
+        _, names = _group_candidates(SCOPE_ALL)
         title = f"{names.get(group_id) or group_id}: подписчики за {days} дн"
     else:
-        title = f"Все группы: подписчики за {days} дн"
+        title = f"{SCOPE_TITLES[scope].capitalize()}: подписчики за {days} дн"
 
     plt = _plt()
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True,
@@ -364,11 +430,13 @@ def _pdf_title_page(plt, data: dict, chart_days: int):
     fig.text(0.05, 0.94, head[0], fontsize=18, fontweight="bold")
     fig.text(0.05, 0.895, head[1], fontsize=12)
     fig.text(0.05, 0.86, head[2], fontsize=12)
-    points = daily_series(chart_days, data["now"])
+    scope = data.get("scope", SCOPE_BOT)
+    points = daily_series(chart_days, data["now"], None, scope)
     if len(points) >= 2:
         ax1 = fig.add_axes([0.08, 0.40, 0.88, 0.40])
         ax2 = fig.add_axes([0.08, 0.15, 0.88, 0.20], sharex=ax1)
-        _draw_growth(ax1, ax2, points, f"Все группы: подписчики за {chart_days} дн")
+        _draw_growth(ax1, ax2, points,
+                     f"{SCOPE_TITLES[scope].capitalize()}: подписчики за {chart_days} дн")
         plt.setp(ax1.get_xticklabels(), visible=False)
         fig.text(0.08, 0.085, "Прирост за день считается только по группам, отслеживаемым оба дня; "
                               "скачок линии в день добавления новой группы — не рост подписчиков.",
@@ -431,9 +499,13 @@ def _style_table(table, colors: list[list[str]], first_delta_col: int) -> None:
             cell.set_text_props(color=colors[row - 1][col - first_delta_col])
 
 
-def _pdf_table_pages(plt, rows: list[dict], heading: str = "Группы"):
+def _pdf_table_pages(plt, rows: list[dict], heading: str = "Группы", show_in_bot: bool = False):
+    """Таблица групп; show_in_bot — столбец «В боте» (для отчёта по всем группам)."""
     cols = ["#", "Группа", "ID", "Подписчики"] + [f"Δ {d} дн" for d in DELTA_PERIODS] + ["Постов 7 дн"]
     widths = [0.04, 0.36, 0.11, 0.11] + [0.09] * len(DELTA_PERIODS) + [0.11]
+    if show_in_bot:
+        cols.append("В боте")
+        widths = [0.04, 0.32, 0.10, 0.10] + [0.08] * len(DELTA_PERIODS) + [0.10, 0.08]
     pages = max(1, -(-len(rows) // TABLE_ROWS_PER_PAGE))
     for page in range(pages):
         chunk = rows[page * TABLE_ROWS_PER_PAGE:(page + 1) * TABLE_ROWS_PER_PAGE]
@@ -449,7 +521,8 @@ def _pdf_table_pages(plt, rows: list[dict], heading: str = "Группы"):
         for i, r in enumerate(chunk, page * TABLE_ROWS_PER_PAGE + 1):
             name = r["name"] if len(r["name"]) <= 45 else r["name"][:44] + "…"
             cells.append([str(i), name, str(r["gid"]), _fmt_int(r["members"])]
-                         + [_fmt_delta(*r["deltas"][d]) for d in DELTA_PERIODS] + [str(r["posts"])])
+                         + [_fmt_delta(*r["deltas"][d]) for d in DELTA_PERIODS] + [str(r["posts"])]
+                         + (["да" if r.get("in_bot") else "нет"] if show_in_bot else []))
             colors.append([_delta_color(r["deltas"][d][0]) for d in DELTA_PERIODS])
         _style_table(ax.table(cellText=cells, colLabels=cols, colWidths=widths,
                               loc="upper center", cellLoc="center"), colors, first_delta_col=4)
@@ -492,13 +565,14 @@ def _pdf_group_pages(plt, rows: list[dict], now: int, chart_days: int, heading: 
         yield fig
 
 
-def build_pdf(now: int | None = None, chart_days: int = 30) -> bytes | None:
+def build_pdf(now: int | None = None, chart_days: int = 30,
+              scope: str = SCOPE_BOT) -> bytes | None:
     """PDF-отчёт: сводка + общий график, сводка по аккаунтам, затем по каждому
     аккаунту — таблица его групп и мини-графики.
 
     None — если групп нет совсем.
     """
-    data = report_data(now)
+    data = report_data(now, scope)
     if not data["groups"]:
         return None
     plt = _plt()
@@ -510,7 +584,8 @@ def build_pdf(now: int | None = None, chart_days: int = 30) -> bytes | None:
         for acc in data["accounts"]:
             heading = (f"{acc['name']} · групп: {acc['groups']} · "
                        f"подписчиков: {_fmt_int(acc['total'])}")
-            yield from _pdf_table_pages(plt, acc["rows"], _short(heading, 90))
+            yield from _pdf_table_pages(plt, acc["rows"], _short(heading, 90),
+                                        show_in_bot=scope == SCOPE_ALL)
             yield from _pdf_group_pages(plt, acc["rows"], data["now"], chart_days, acc["name"])
 
     buf = BytesIO()
@@ -522,6 +597,7 @@ def build_pdf(now: int | None = None, chart_days: int = 30) -> bytes | None:
     return buf.read()
 
 
-def pdf_filename(now: int | None = None) -> str:
+def pdf_filename(now: int | None = None, scope: str = SCOPE_BOT) -> str:
     now = int(now if now is not None else time.time())
-    return f"metrics_{datetime.fromtimestamp(now, MOSCOW_TZ):%Y-%m-%d_%H-%M}.pdf"
+    suffix = "_all" if scope == SCOPE_ALL else ""
+    return f"metrics{suffix}_{datetime.fromtimestamp(now, MOSCOW_TZ):%Y-%m-%d_%H-%M}.pdf"

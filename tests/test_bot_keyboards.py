@@ -133,3 +133,22 @@ def _registered_patterns() -> list[re.Pattern]:
 def test_pager_callbacks_are_registered(callback):
     assert any(p.match(callback) for p in _registered_patterns()), (
         f"{callback}: ни один CallbackQueryHandler не ловит эту кнопку — она не сработает")
+
+
+@pytest.mark.parametrize("callback", [
+    "met_scope_bot", "met_scope_all", "met_refresh_all", "met_text_bot", "met_chart_30_all",
+    "met_refresh", "met_text", "met_chart_7",   # кнопки под старыми отчётами
+])
+def test_metrics_callbacks_are_registered(callback):
+    assert any(p.match(callback) for p in _registered_patterns()), callback
+
+
+def test_metrics_kb_callbacks_parse_back():
+    import metrics
+    for scope in metrics.SCOPES:
+        for cb in _callbacks(bot._metrics_kb(scope)) + _callbacks(bot._metrics_scope_kb()):
+            assert any(p.match(cb) for p in _registered_patterns()), cb
+            action, parsed = bot._parse_metrics_callback(cb)
+            assert parsed in metrics.SCOPES and action
+    assert bot._parse_metrics_callback("met_chart_30_all") == ("chart_30", "all")
+    assert bot._parse_metrics_callback("met_refresh") == ("refresh", "bot")

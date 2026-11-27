@@ -179,6 +179,17 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_group_metrics_group
                 ON group_metrics (vk_group_id, captured_at);
+
+            -- Сообщества под управлением VK-аккаунта (groups.get filter=admin,editor,moder),
+            -- в том числе не добавленные в бота. Перезаписывается при каждом снимке метрики.
+            CREATE TABLE IF NOT EXISTS account_managed_groups (
+                account_id  INTEGER NOT NULL,
+                vk_group_id INTEGER NOT NULL,
+                name        TEXT,
+                seen_at     INTEGER NOT NULL,
+                PRIMARY KEY (account_id, vk_group_id),
+                FOREIGN KEY (account_id) REFERENCES vk_accounts(id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -948,6 +959,42 @@ def get_all_groups_for_metrics() -> list[sqlite3.Row]:
             FROM vk_groups g
             LEFT JOIN vk_accounts a ON a.id = g.account_id
             ORDER BY g.vk_group_id, g.id
+            """
+        ).fetchall()
+
+
+def get_all_accounts_for_metrics() -> list[sqlite3.Row]:
+    """Все VK-аккаунты всех пользователей, у которых есть токен."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT id, telegram_id, name FROM vk_accounts "
+            "WHERE vk_token IS NOT NULL ORDER BY telegram_id, id"
+        ).fetchall()
+
+
+def set_managed_groups(account_id: int, groups: list[tuple[int, str | None]],
+                       seen_at: int | None = None) -> None:
+    """Заменить список сообществ под управлением аккаунта: groups = [(vk_group_id, name)]."""
+    ts = int(seen_at if seen_at is not None else time.time())
+    with _connect() as conn:
+        conn.execute("DELETE FROM account_managed_groups WHERE account_id = ?", (account_id,))
+        conn.executemany(
+            "INSERT OR REPLACE INTO account_managed_groups (account_id, vk_group_id, name, seen_at) "
+            "VALUES (?, ?, ?, ?)",
+            [(account_id, abs(int(gid)), name, ts) for gid, name in groups],
+        )
+
+
+def get_managed_groups_for_metrics() -> list[sqlite3.Row]:
+    """Сообщества под управлением аккаунтов: vk_group_id, имя, аккаунт и его владелец."""
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT m.vk_group_id, m.name, m.account_id, a.telegram_id,
+                   a.name AS account_name
+            FROM account_managed_groups m
+            JOIN vk_accounts a ON a.id = m.account_id
+            ORDER BY m.vk_group_id, m.account_id
             """
         ).fetchall()
 

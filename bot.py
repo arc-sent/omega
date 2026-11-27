@@ -1799,17 +1799,29 @@ async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Метрика групп (только админ) ─────────────────────────────────────────────
 
-def _metrics_kb() -> InlineKeyboardMarkup:
+def _metrics_kb(scope: str = metrics.SCOPE_BOT) -> InlineKeyboardMarkup:
+    """Кнопки под отчётом; scope — чтобы график/обновление шли по тем же группам."""
+    other = metrics.SCOPE_ALL if scope == metrics.SCOPE_BOT else metrics.SCOPE_BOT
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📈 График {d} дн", callback_data=f"met_chart_{d}")
+        [InlineKeyboardButton(f"📈 График {d} дн", callback_data=f"met_chart_{d}_{scope}")
          for d in metrics.CHART_PERIODS],
-        [InlineKeyboardButton("🔄 Обновить (PDF)", callback_data="met_refresh"),
-         InlineKeyboardButton("📝 Текстом", callback_data="met_text")],
+        [InlineKeyboardButton("🔄 Обновить (PDF)", callback_data=f"met_refresh_{scope}"),
+         InlineKeyboardButton("📝 Текстом", callback_data=f"met_text_{scope}")],
+        [InlineKeyboardButton(f"🔀 Показать: {metrics.SCOPE_TITLES[other]}",
+                              callback_data=f"met_scope_{other}")],
     ])
 
 
-async def _send_metrics_report(message, *, refresh: bool) -> None:
-    """Снять свежий снимок (если refresh) и прислать PDF-отчёт по всем группам."""
+def _metrics_scope_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Группы из бота", callback_data=f"met_scope_{metrics.SCOPE_BOT}")],
+        [InlineKeyboardButton("🌐 Все группы аккаунтов",
+                              callback_data=f"met_scope_{metrics.SCOPE_ALL}")],
+    ])
+
+
+async def _send_metrics_report(message, *, refresh: bool, scope: str = metrics.SCOPE_BOT) -> None:
+    """Снять свежий снимок (если refresh) и прислать PDF-отчёт по группам scope."""
     loop = asyncio.get_running_loop()
     note = ""
     wait = await message.reply_text(
@@ -1819,9 +1831,12 @@ async def _send_metrics_report(message, *, refresh: bool) -> None:
         if refresh:
             res = await loop.run_in_executor(None, metrics.collect_snapshot)
             note = f"Снято: {res['saved']} из {res['total']}."
+            if res.get("accounts_failed"):
+                note += (f" Список групп под управлением не получен у "
+                         f"{len(res['accounts_failed'])} акк. (нет права groups или токен устарел).")
         now = int(time.time())
-        data = await loop.run_in_executor(None, metrics.report_data, now)
-        pdf = await loop.run_in_executor(None, metrics.build_pdf, now)
+        data = await loop.run_in_executor(None, metrics.report_data, now, scope)
+        pdf = await loop.run_in_executor(None, metrics.build_pdf, now, 30, scope)
     finally:
         await wait.delete()
     if pdf is None:
@@ -1830,32 +1845,38 @@ async def _send_metrics_report(message, *, refresh: bool) -> None:
     head = metrics.summary_lines(data)
     caption = "\n".join(["📊 " + head[0], *head[1:], *([note] if note else [])])
     await message.reply_document(
-        document=BytesIO(pdf), filename=metrics.pdf_filename(now),
-        caption=caption[:1024], reply_markup=_metrics_kb(),
+        document=BytesIO(pdf), filename=metrics.pdf_filename(now, scope),
+        caption=caption[:1024], reply_markup=_metrics_kb(scope),
     )
 
 
-async def _send_metrics_text(message) -> None:
+async def _send_metrics_text(message, scope: str = metrics.SCOPE_BOT) -> None:
     """Тот же отчёт текстом (без нового снимка)."""
     loop = asyncio.get_running_loop()
-    lines = await loop.run_in_executor(None, metrics.build_report)
+    lines = await loop.run_in_executor(None, metrics.build_report, None, scope)
     for part in metrics.split_messages(lines):
         await message.reply_text(part)
 
 
 async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/metrics — свежий снимок + PDF-отчёт; /metrics <id группы> — график одной группы."""
+    """/metrics — выбор: группы из бота или все группы аккаунтов; /metrics bot|all — сразу
+    PDF; /metrics <id группы> [дней] — график одной группы."""
     if not _is_admin(update.effective_user.id):
         return
-    if context.args:
+    args = context.args or []
+    if args and args[0].lower() in metrics.SCOPES:
+        await _send_metrics_report(update.message, refresh=True, scope=args[0].lower())
+        return
+    if args:
         try:
-            gid = abs(int(context.args[0]))
+            gid = abs(int(args[0]))
         except ValueError:
-            await update.message.reply_text("Формат: /metrics или /metrics <id группы VK>")
+            await update.message.reply_text(
+                "Формат: /metrics, /metrics bot, /metrics all или /metrics <id группы VK> [дней]")
             return
         days = 30
-        if len(context.args) > 1 and context.args[1].isdigit():
-            days = max(2, min(int(context.args[1]), 365))
+        if len(args) > 1 and args[1].isdigit():
+            days = max(2, min(int(args[1]), 365))
         loop = asyncio.get_running_loop()
         chart = await loop.run_in_executor(None, metrics.build_chart, days, None, gid)
         if chart is None:
@@ -1863,7 +1884,22 @@ async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await update.message.reply_photo(photo=BytesIO(chart), caption=f"📈 Группа {gid} · {days} дн")
         return
-    await _send_metrics_report(update.message, refresh=True)
+    await update.message.reply_text(
+        "📊 По каким группам собрать метрику?\n"
+        "• Группы из бота — те, что добавлены в бота для публикации.\n"
+        "• Все группы аккаунтов — плюс все сообщества, где VK-аккаунт админ, "
+        "редактор или модератор.",
+        reply_markup=_metrics_scope_kb(),
+    )
+
+
+def _parse_metrics_callback(data: str) -> tuple[str, str]:
+    """met_<действие>[_<scope>] → (действие, scope). Старые кнопки без scope — «из бота»."""
+    body = data[len("met_"):]
+    head, _, tail = body.rpartition("_")
+    if tail in metrics.SCOPES and head:
+        return head, tail
+    return body, metrics.SCOPE_BOT
 
 
 async def metrics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1871,24 +1907,26 @@ async def metrics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not _is_admin(query.from_user.id):
         await query.answer()
         return
-    if query.data == "met_refresh":
-        await query.answer("Обновляю…")
-        await _send_metrics_report(query.message, refresh=True)
+    action, scope = _parse_metrics_callback(query.data)
+    if action in ("scope", "refresh"):
+        await query.answer("Собираю…")
+        await _send_metrics_report(query.message, refresh=True, scope=scope)
         return
-    if query.data == "met_text":
+    if action == "text":
         await query.answer()
-        await _send_metrics_text(query.message)
+        await _send_metrics_text(query.message, scope)
         return
-    days = int(query.data.rsplit("_", 1)[1])
+    days = int(action.rsplit("_", 1)[1])
     await query.answer()
     loop = asyncio.get_running_loop()
-    chart = await loop.run_in_executor(None, metrics.build_chart, days)
+    chart = await loop.run_in_executor(None, metrics.build_chart, days, None, None, scope)
     if chart is None:
         await query.message.reply_text(
             "Мало данных для графика: снимки копятся раз в сутки, нужно хотя бы 2 дня."
         )
         return
-    await query.message.reply_photo(photo=BytesIO(chart), caption=f"📈 Все группы · {days} дн")
+    await query.message.reply_photo(
+        photo=BytesIO(chart), caption=f"📈 {metrics.SCOPE_TITLES[scope].capitalize()} · {days} дн")
 
 
 async def _metrics_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2078,7 +2116,7 @@ def main() -> None:
     app.add_handler(CommandHandler("process", cmd_process))
     app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("reparse", cmd_reparse))
-    app.add_handler(CallbackQueryHandler(metrics_callback, pattern=r"^met_(refresh|text|chart_\d+)$"))
+    app.add_handler(CallbackQueryHandler(metrics_callback, pattern=r"^met_(scope_(bot|all)|(refresh|text|chart_\d+)(_(bot|all))?)$"))
     app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats_period_"))
     app.add_handler(CallbackQueryHandler(stats_chart_callback, pattern=r"^stats_chart_"))
     app.add_handler(CallbackQueryHandler(errors_callback, pattern=r"^err_"))
